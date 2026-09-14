@@ -389,6 +389,11 @@ body.selection-mode .pdf-card {
   box-shadow: 0 2px 8px rgba(0, 0, 0, .3);
 }
 
+/* O display:flex acima venceria o atributo hidden. */
+#relink-bar[hidden] {
+  display: none;
+}
+
 #relink-text {
   flex: 1;
   min-width: 0;
