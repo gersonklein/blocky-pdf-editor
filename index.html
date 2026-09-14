@@ -20,6 +20,7 @@
     <button id="btnSave" class="btn">Salvar Projeto</button>
     <button id="btnSaveFull" class="btn" title="Inclui os PDFs no arquivo: maior, mas reabre em qualquer computador">Salvar com PDFs</button>
     <button id="btnLoad" class="btn">Abrir Projeto</button>
+    <button id="btnGuia" class="btn" title="Como o texto é montado a partir dos blocos">Guia</button>
   </header>
 
   <main id="main">
@@ -47,6 +48,123 @@
 
   <input type="file" id="pdfFileInput" accept="application/pdf,.pdf" multiple hidden>
   <input type="file" id="projectFileInput" accept="application/json,.json" hidden>
+
+
+  <div id="guia-overlay" hidden>
+    <div id="guia" role="dialog" aria-modal="true" aria-labelledby="guia-titulo">
+      <header id="guia-head">
+        <h2 id="guia-titulo">Como o texto é montado</h2>
+        <button type="button" id="guia-fechar" class="btn ghost" aria-label="Fechar">&#10005;</button>
+      </header>
+
+      <div id="guia-corpo">
+        <section>
+          <h3>A regra padrão</h3>
+          <ul>
+            <li>Cada bloco de texto vira um <strong>parágrafo</strong> — os blocos são separados por uma linha em branco.</li>
+            <li>Uma <strong>pilha</strong> (blocos encaixados) é lida inteira, de cima para baixo.</li>
+            <li>Com várias pilhas, cada uma é lida <strong>inteira antes de a próxima começar</strong>. Elas nunca se intercalam, por mais próximas que estejam na tela.</li>
+            <li>A ordem entre pilhas é <strong>coluna a coluna</strong>, da esquerda para a direita; dentro de cada coluna, de cima para baixo.</li>
+          </ul>
+          <p class="nota">Quando existe mais de uma pilha, um <span class="selo-demo">1</span> azul aparece no canto de cada uma mostrando a posição dela na leitura. O selo é a fonte da verdade: se ele está certo, o .txt sai certo.</p>
+        </section>
+
+        <section>
+          <h3>Os marcadores</h3>
+          <p>Ficam na categoria <em>Marcadores</em> da caixa de ferramentas. Encaixam na pilha como qualquer bloco, mas não carregam texto do PDF — só mudam a montagem.</p>
+          <table class="guia-tabela">
+            <thead>
+              <tr><th>Marcador</th><th>O que faz no arquivo</th><th>Onde colocar</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>&#9635; pilha nº</code></td>
+                <td>Nada. Fixa em que posição esta pilha é lida, ignorando a posição na tela.</td>
+                <td>Só no topo de uma pilha — o bloco não tem encaixe superior, então o Blockly não deixa errar.</td>
+              </tr>
+              <tr>
+                <td><code>&#9472;&#9472; separador</code></td>
+                <td>Escreve a linha exatamente como está no campo (<code>---</code>, <code>* * *</code>, o que você quiser).</td>
+                <td>Entre dois trechos, onde a seção muda.</td>
+              </tr>
+              <tr>
+                <td><code>&#9166; N linhas em branco</code></td>
+                <td>Abre mais espaço antes do próximo trecho. Entre trechos o padrão já é 1 linha em branco.</td>
+                <td>Entre dois trechos.</td>
+              </tr>
+              <tr>
+                <td><code>&#8251; nota</code></td>
+                <td>Nada, nunca. Não vai para o .txt em hipótese alguma.</td>
+                <td>Onde você quiser deixar um lembrete: “conferir esta tabela”, “falta a página 7”.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section>
+          <h3>Mandando na ordem das pilhas</h3>
+          <p>Sem marcador nenhum, a ordem vem da posição no canvas — o que funciona bem enquanto as pilhas estão organizadas em colunas. Quando você quiser garantia, ponha um <code>&#9635; pilha nº</code> no topo de cada uma:</p>
+          <ul>
+            <li>O número manda: <code>nº 1</code> sai antes de <code>nº 2</code>, esteja onde estiver na tela.</li>
+            <li>O título ao lado do número é só para você se achar — não vai para o arquivo.</li>
+            <li><strong>Numere todas ou nenhuma.</strong> Numa mistura, as pilhas numeradas vão primeiro, na ordem dos números, e as sem número vêm depois, na ordem das colunas.</li>
+            <li>Dois cabeçalhos com o mesmo número deixam a ordem entre eles indefinida — o bloco avisa com &#9888;.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Exemplo</h3>
+          <div class="guia-exemplo">
+            <pre>PILHA À ESQUERDA        PILHA À DIREITA
+
+&#9635; pilha nº 1            &#9635; pilha nº 2
+   Método                  Conclusão
+&#9633; O ensaio foi feito   &#9633; Os dados sustentam
+  em três etapas...          a hipótese inicial.
+&#9472;&#9472; separador ---
+&#8251; falta a etapa 4
+&#9633; A primeira etapa
+  consistiu em...</pre>
+            <div class="guia-seta">&#8594;</div>
+            <pre>O ensaio foi feito
+em três etapas...
+
+---
+
+A primeira etapa
+consistiu em...
+
+Os dados sustentam
+a hipótese inicial.</pre>
+          </div>
+          <p class="nota">A nota sumiu, o cabeçalho de pilha não escreveu nada, e a pilha 2 entrou inteira depois da pilha 1.</p>
+        </section>
+
+        <section>
+          <h3>Os avisos &#9888;</h3>
+          <p>Um triângulo no bloco significa “isto não vai fazer o que você espera”. Clique nele para ler. Os casos:</p>
+          <ul>
+            <li><strong>Bloco sem texto</strong> — fica no workspace, mas não entra na exportação.</li>
+            <li><strong>Espaço na ponta da pilha</strong> — um <code>&#9166;</code> sem trecho antes ou depois não separa nada.</li>
+            <li><strong>Separador vazio</strong> — campo em branco não escreve linha nenhuma.</li>
+            <li><strong>Pilha sem texto</strong> — um cabeçalho sozinho ocupa um número de ordem sem produzir nada.</li>
+            <li><strong>Número repetido</strong> — duas pilhas disputando a mesma posição.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Miudezas que economizam tempo</h3>
+          <ul>
+            <li>Marcadores entram no <strong>Salvar Projeto</strong> junto com o resto — nada a fazer.</li>
+            <li>Para reordenar uma pilha inteira, arraste pelo <strong>bloco de topo</strong>: os de baixo vêm junto.</li>
+            <li>Para desmembrar, arraste um bloco do meio — ele leva consigo tudo o que está abaixo.</li>
+            <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> desfaz encaixe, edição e criação de bloco.</li>
+            <li>Botão direito no bloco: duplicar, colapsar, desabilitar. Bloco <em>desabilitado</em> continua na tela mas fica fora do .txt — útil para testar uma versão do texto sem apagar nada.</li>
+          </ul>
+        </section>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

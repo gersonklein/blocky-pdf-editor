@@ -344,6 +344,272 @@ function defineBlocks() {
       if (state.color) this.setColour(state.color);
     },
   };
+
+  defineMarcadores();
+}
+
+// ---------------------------------------------------------------
+// Marcadores
+// ---------------------------------------------------------------
+// Blocos que não carregam texto do PDF: entram na mesma pilha dos trechos e
+// só influenciam a montagem do arquivo final. A aparência mora aqui e o
+// efeito mora no `switch` de montarPilha() — um marcador novo é sempre esses
+// dois pontos, nada mais.
+const COR_PILHA = 210; // cabeçalho de pilha
+const COR_LAYOUT = 260; // espaçamento e separadores escritos no .txt
+const COR_NOTA = 60; // nunca exporta
+
+function defineMarcadores() {
+  // Cabeçalho de pilha. Sem conexão anterior de propósito: o próprio Blockly
+  // impede encaixá-lo no meio de uma pilha, então esse estado inválido não
+  // chega a existir e não precisa ser validado depois.
+  Blockly.Blocks["txt_pilha"] = {
+    init: function () {
+      this.appendDummyInput()
+        .appendField("\u25a3 pilha nº")
+        .appendField(new Blockly.FieldNumber(1, 1, 99, 1), "ORDEM")
+        .appendField(new Blockly.FieldTextInput("sem título"), "ROTULO");
+      this.setNextStatement(true, null);
+      this.setColour(COR_PILHA);
+      this.setTooltip(
+        "Fixa a posição desta pilha no texto exportado. Só encaixa no topo de " +
+          "uma pilha. O número e o título não vão para o .txt."
+      );
+    },
+  };
+
+  Blockly.Blocks["txt_separador"] = {
+    init: function () {
+      this.appendDummyInput()
+        .appendField("\u2500\u2500 separador")
+        .appendField(new Blockly.FieldTextInput("---"), "LINHA");
+      this.setPreviousStatement(true, null);
+      this.setNextStatement(true, null);
+      this.setColour(COR_LAYOUT);
+      this.setTooltip(
+        "Escreve esta linha literalmente no .txt, como se fosse um trecho de " +
+          "texto. Serve para separar seções."
+      );
+    },
+  };
+
+  Blockly.Blocks["txt_espaco"] = {
+    init: function () {
+      this.appendDummyInput()
+        .appendField("\u23ce")
+        .appendField(new Blockly.FieldNumber(2, 1, 10, 1), "QTD")
+        .appendField("linha(s) em branco");
+      this.setPreviousStatement(true, null);
+      this.setNextStatement(true, null);
+      this.setColour(COR_LAYOUT);
+      this.setTooltip(
+        "Aumenta o espaço antes do próximo trecho. Entre trechos o padrão já é " +
+          "uma linha em branco."
+      );
+    },
+  };
+
+  Blockly.Blocks["txt_nota"] = {
+    init: function () {
+      this.appendDummyInput()
+        .appendField("\u203b")
+        .appendField(new Blockly.FieldTextInput("anotação"), "NOTA");
+      this.setPreviousStatement(true, null);
+      this.setNextStatement(true, null);
+      this.setColour(COR_NOTA);
+      this.setTooltip("Lembrete para você. Nunca aparece no texto exportado.");
+    },
+  };
+}
+
+// ---------------------------------------------------------------
+// Ordem de leitura das pilhas
+// ---------------------------------------------------------------
+// `workspace.getTopBlocks(true)` ordena quase só por Y (inclina o eixo em 3
+// graus), então duas pilhas lado a lado saem na ordem de quem tem o topo mais
+// alto — não na ordem das colunas. Para montar um texto de várias pilhas isso
+// é imprevisível demais, então a ordem é calculada aqui: coluna a coluna, da
+// esquerda para a direita, e cada coluna de cima para baixo. Um cabeçalho
+// `txt_pilha` com número tem precedência sobre a geometria.
+//
+// Tolerância horizontal para duas pilhas contarem como a mesma coluna. Um
+// bloco de texto tem ~340px, então pilhas desalinhadas em menos de ~3/4 de
+// bloco ainda são "a mesma coluna".
+const TOLERANCIA_COLUNA = 260;
+
+function pilhasNaOrdem() {
+  if (!workspace) return [];
+
+  const topos = workspace
+    .getTopBlocks(false)
+    .filter((b) => !b.isShadow() && !b.isInsertionMarker());
+
+  const itens = topos.map((b) => {
+    const xy = b.getRelativeToSurfaceXY();
+    const cab = b.type === "txt_pilha" ? b : null;
+    return {
+      block: b,
+      x: xy.x,
+      y: xy.y,
+      ordem: cab ? Number(cab.getFieldValue("ORDEM")) : null,
+      rotulo: cab ? cab.getFieldValue("ROTULO") : null,
+    };
+  });
+
+  const numeradas = itens
+    .filter((i) => Number.isFinite(i.ordem))
+    .sort((a, b) => a.ordem - b.ordem || a.y - b.y);
+
+  // Colunas ancoradas: a comparação é sempre com o X da primeira pilha da
+  // coluna, nunca com a da pilha anterior — senão pilhas espaçadas de 200 em
+  // 200px se encadeariam todas numa coluna só.
+  const colunas = [];
+  const soltas = itens
+    .filter((i) => !Number.isFinite(i.ordem))
+    .sort((a, b) => a.x - b.x);
+  for (const i of soltas) {
+    const col = colunas.find((c) => Math.abs(i.x - c.x) <= TOLERANCIA_COLUNA);
+    if (col) col.itens.push(i);
+    else colunas.push({ x: i.x, itens: [i] });
+  }
+  const geometricas = colunas.flatMap((c) => c.itens.sort((a, b) => a.y - b.y));
+
+  return [...numeradas, ...geometricas];
+}
+
+// ---------------------------------------------------------------
+// Selo com o número de leitura da pilha
+// ---------------------------------------------------------------
+// O selo é um <g> pendurado no próprio SVG do bloco de topo: acompanha
+// arraste e zoom sem nenhum listener de viewport, e some junto com o bloco.
+const SVG_NS = "http://www.w3.org/2000/svg";
+const comSelo = new Set();
+
+function removerSelo(block) {
+  const g = block.__seloOrdem;
+  if (g && g.parentNode) g.parentNode.removeChild(g);
+  block.__seloOrdem = null;
+  comSelo.delete(block);
+}
+
+function aplicarSelo(block, n) {
+  const raiz = block.getSvgRoot();
+  if (!raiz) return;
+  let g = block.__seloOrdem;
+  if (!g || !g.parentNode) {
+    g = document.createElementNS(SVG_NS, "g");
+    g.setAttribute("class", "stack-badge");
+    const c = document.createElementNS(SVG_NS, "circle");
+    c.setAttribute("cx", "-19");
+    c.setAttribute("cy", "14");
+    c.setAttribute("r", "12");
+    const t = document.createElementNS(SVG_NS, "text");
+    t.setAttribute("x", "-19");
+    t.setAttribute("y", "18");
+    t.setAttribute("text-anchor", "middle");
+    g.appendChild(c);
+    g.appendChild(t);
+    raiz.appendChild(g);
+    block.__seloOrdem = g;
+    comSelo.add(block);
+  }
+  g.querySelector("text").textContent = String(n);
+}
+
+// ---------------------------------------------------------------
+// Validação: mostra na tela o que não vai sair no .txt
+// ---------------------------------------------------------------
+function escreveAlgo(b) {
+  if (b.type === "pdf_text") return !!(b.getFieldValue("TEXT") || "").trim();
+  if (b.type === "txt_separador") return !!(b.getFieldValue("LINHA") || "").trim();
+  return false;
+}
+
+function revalidarWorkspace() {
+  const pilhas = pilhasNaOrdem();
+
+  // Selo: com uma pilha só, o número é ruído.
+  const mostrarSelo = pilhas.length > 1;
+  for (const b of Array.from(comSelo)) {
+    if (!mostrarSelo || !pilhas.some((p) => p.block === b)) removerSelo(b);
+  }
+  if (mostrarSelo) pilhas.forEach((p, i) => aplicarSelo(p.block, i + 1));
+
+  // Dois cabeçalhos com o mesmo número deixam a ordem entre eles indefinida.
+  const usados = new Map();
+  for (const p of pilhas) {
+    if (Number.isFinite(p.ordem)) usados.set(p.ordem, (usados.get(p.ordem) || 0) + 1);
+  }
+
+  for (const p of pilhas) {
+    const blocos = [];
+    for (let b = p.block; b; b = b.getNextBlock()) blocos.push(b);
+    const algumTexto = blocos.some(escreveAlgo);
+
+    blocos.forEach((b, idx) => {
+      let aviso = null;
+      const antes = blocos.slice(0, idx).some(escreveAlgo);
+      const depois = blocos.slice(idx + 1).some(escreveAlgo);
+
+      switch (b.type) {
+        case "pdf_text":
+          if (!(b.getFieldValue("TEXT") || "").trim())
+            aviso = "Bloco sem texto: não entra na exportação.";
+          break;
+        case "txt_espaco":
+          if (!antes || !depois) aviso = "Espaço na ponta da pilha: sem efeito.";
+          break;
+        case "txt_separador":
+          if (!(b.getFieldValue("LINHA") || "").trim())
+            aviso = "Separador vazio: não escreve nada.";
+          break;
+        case "txt_pilha":
+          if (usados.get(p.ordem) > 1)
+            aviso = "Outra pilha usa o mesmo número: a ordem entre as duas fica indefinida.";
+          else if (!algumTexto) aviso = "Esta pilha não tem nenhum trecho de texto.";
+          break;
+      }
+
+      b.setWarningText(aviso);
+    });
+  }
+}
+
+// Durante um arraste os eventos chegam a cada quadro, então a passada é
+// adiada e coalescida. `setTimeout` e não `requestAnimationFrame`: o rAF não
+// dispara em aba oculta, e uma revalidação agendada ficaria pendurada com a
+// flag levantada -- todas as seguintes seriam engolidas até a aba voltar.
+let revalidacaoAgendada = false;
+function agendarRevalidacao() {
+  if (revalidacaoAgendada) return;
+  revalidacaoAgendada = true;
+  setTimeout(() => {
+    revalidacaoAgendada = false;
+    try {
+      revalidarWorkspace();
+    } catch (err) {
+      console.error("[marcadores] falha ao revalidar:", err);
+    }
+  }, 0);
+}
+
+function initValidacao() {
+  const ESTRUTURAIS = new Set([
+    Blockly.Events.BLOCK_CREATE,
+    Blockly.Events.BLOCK_DELETE,
+    Blockly.Events.BLOCK_MOVE,
+    Blockly.Events.BLOCK_CHANGE,
+    Blockly.Events.FINISHED_LOADING,
+  ]);
+
+  workspace.addChangeListener((e) => {
+    if (!ESTRUTURAIS.has(e.type)) return;
+    // O próprio aviso é uma BLOCK_CHANGE: ignorá-la corta o ciclo.
+    if (e.type === Blockly.Events.BLOCK_CHANGE && e.element === "warning") return;
+    agendarRevalidacao();
+  });
+
+  agendarRevalidacao();
 }
 
 // ---------------------------------------------------------------
@@ -352,9 +618,29 @@ function defineBlocks() {
 function initBlockly() {
   defineBlocks();
 
+  // Com marcadores no jogo o flyout único vira uma lista sem contexto: as
+  // categorias separam "o que vira texto" de "o que só organiza".
   const toolbox = {
-    kind: "flyoutToolbox",
-    contents: [{ kind: "block", type: "pdf_text" }],
+    kind: "categoryToolbox",
+    contents: [
+      {
+        kind: "category",
+        name: "Texto",
+        colour: "160",
+        contents: [{ kind: "block", type: "pdf_text" }],
+      },
+      {
+        kind: "category",
+        name: "Marcadores",
+        colour: "210",
+        contents: [
+          { kind: "block", type: "txt_pilha" },
+          { kind: "block", type: "txt_separador" },
+          { kind: "block", type: "txt_espaco" },
+          { kind: "block", type: "txt_nota" },
+        ],
+      },
+    ],
   };
 
   workspace = Blockly.inject(blocklyDiv, {
@@ -377,6 +663,8 @@ function initBlockly() {
   });
 
   window.addEventListener("resize", () => Blockly.svgResize(workspace));
+
+  initValidacao();
 }
 
 // ---------------------------------------------------------------
@@ -1216,33 +1504,59 @@ function setSelectionMode(on) {
 // ---------------------------------------------------------------
 // Exportar texto montado (blocos de cima para baixo)
 // ---------------------------------------------------------------
-function exportText() {
-  const blocks = workspace.getBlocksByType("pdf_text", false);
-  if (!blocks.length) {
-    toast("Nenhum bloco para exportar.");
-    return;
-  }
+// Separador padrão entre dois trechos e entre duas pilhas: uma linha em
+// branco, ou seja, parágrafo novo.
+const PARAGRAFO = "\n\n";
 
-  // Percorre pilha por pilha, do topo para baixo, na ordem em que as pilhas
-  // aparecem no workspace. Ordenar a lista achatada pela posição intercalava
-  // pilhas lado a lado e dependia das coordenadas de blocos já encaixados,
-  // que não acompanham a posição real dentro da pilha.
-  const parts = [];
-  for (const top of workspace.getTopBlocks(true)) {
-    for (let b = top; b; b = b.getNextBlock()) {
-      if (b.type !== "pdf_text") continue;
-      const t = (b.getFieldValue("TEXT") || "").trim();
-      if (t) parts.push(t);
+// Monta uma pilha inteira, de cima para baixo. Marcadores que não escrevem
+// nada (cabeçalho, nota) simplesmente não contribuem.
+function montarPilha(topo) {
+  const partes = [];
+  let extra = null; // linhas em branco pedidas por um ⏎ ainda não gasto
+
+  for (let b = topo; b; b = b.getNextBlock()) {
+    let trecho;
+    switch (b.type) {
+      case "pdf_text":
+        trecho = (b.getFieldValue("TEXT") || "").trim();
+        break;
+      case "txt_separador":
+        trecho = (b.getFieldValue("LINHA") || "").trim();
+        break;
+      case "txt_espaco":
+        extra = Number(b.getFieldValue("QTD")) || 1;
+        continue;
+      default: // txt_pilha, txt_nota e qualquer marcador futuro mudo
+        continue;
     }
+
+    if (!trecho) continue;
+    if (partes.length) partes.push(extra ? "\n".repeat(extra + 1) : PARAGRAFO);
+    partes.push(trecho);
+    extra = null;
   }
 
-  const text = parts
-    .join("\n\n");
+  return partes.join("");
+}
 
-  if (!text) {
-    toast("Os blocos estão vazios.");
+function exportText() {
+  if (!workspace) return;
+
+  // Pilha por pilha, na ordem de leitura — a mesma que os selos mostram na
+  // tela. Achatar tudo e ordenar por posição intercalava pilhas lado a lado.
+  const pilhas = pilhasNaOrdem();
+  const textos = [];
+  for (const p of pilhas) {
+    const t = montarPilha(p.block);
+    if (t) textos.push(t);
+  }
+
+  if (!textos.length) {
+    toast("Nenhum texto para exportar.");
     return;
   }
+
+  const text = textos.join(PARAGRAFO);
 
   downloadBlob(
     new Blob([text], { type: "text/plain;charset=utf-8" }),
@@ -1251,7 +1565,11 @@ function exportText() {
   if (navigator.clipboard) {
     navigator.clipboard.writeText(text).catch(() => {});
   }
-  toast("Texto exportado (arquivo .txt + área de transferência).");
+  toast(
+    textos.length === 1
+      ? "Texto exportado (arquivo .txt + área de transferência)."
+      : `Texto exportado: ${textos.length} pilhas na ordem dos selos.`
+  );
 }
 
 // ---------------------------------------------------------------
@@ -1373,6 +1691,7 @@ async function loadProject(file) {
     // `loadExtraState` roda antes de o bloco ter SVG, entao o tom e aplicado
     // aqui, com o workspace ja renderizado.
     workspace.getAllBlocks(false).forEach(applyPdfTint);
+    agendarRevalidacao();
   } catch (err) {
     console.error(err);
     toast("Não foi possível carregar os blocos do projeto.");
@@ -1649,6 +1968,7 @@ function initToolbar() {
   );
 
   $("#btnExport").addEventListener("click", exportText);
+  initGuia();
   $("#relink-skip").addEventListener("click", esconderBarraReligacao);
 
   $("#btnSave").addEventListener("click", saveProject);
@@ -1658,6 +1978,32 @@ function initToolbar() {
   projectFileInput.addEventListener("change", () => {
     loadProject(projectFileInput.files[0]);
     projectFileInput.value = "";
+  });
+}
+
+// ---------------------------------------------------------------
+// Guia
+// ---------------------------------------------------------------
+function initGuia() {
+  const overlay = $("#guia-overlay");
+  const btn = $("#btnGuia");
+  if (!overlay || !btn) return;
+
+  const fechar = () => {
+    overlay.hidden = true;
+  };
+
+  btn.addEventListener("click", () => {
+    overlay.hidden = false;
+    $("#guia-corpo").scrollTop = 0;
+  });
+  $("#guia-fechar").addEventListener("click", fechar);
+  // Clique no fundo escuro fecha; clique dentro do painel, não.
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) fechar();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !overlay.hidden) fechar();
   });
 }
 

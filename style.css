@@ -373,6 +373,13 @@ body.selection-mode .pdf-card {
 }
 
 /* ---------- Barra de religação dos PDFs de um projeto leve ---------- */
+/* Mesmo caso do guia: o `display: flex` de autor vence o `[hidden]` da folha
+   do navegador, e a barra ficava visível o tempo todo, vazia, mesmo com
+   `bar.hidden = true`. */
+#relink-bar[hidden] {
+  display: none;
+}
+
 #relink-bar {
   position: absolute;
   top: 0;
@@ -389,11 +396,6 @@ body.selection-mode .pdf-card {
   box-shadow: 0 2px 8px rgba(0, 0, 0, .3);
 }
 
-/* O display:flex acima venceria o atributo hidden. */
-#relink-bar[hidden] {
-  display: none;
-}
-
 #relink-text {
   flex: 1;
   min-width: 0;
@@ -406,4 +408,189 @@ body.selection-mode .pdf-card {
   background: transparent;
   border-color: #475569;
   color: #94a3b8;
+}
+
+/* ---------- Selo com a ordem de leitura da pilha ---------- */
+/* Pendurado no <g> do bloco de topo, então acompanha arraste e zoom sozinho.
+   Sem pointer-events ele roubaria o clique que inicia o arraste do bloco. */
+.stack-badge {
+  pointer-events: none;
+}
+
+.stack-badge circle {
+  fill: #0ea5e9;
+  stroke: #0f172a;
+  stroke-width: 1.5;
+}
+
+.stack-badge text {
+  fill: #fff;
+  font: 700 13px "Segoe UI", system-ui, sans-serif;
+}
+
+/* ---------- Guia ---------- */
+/* O `display: flex` abaixo é de autor e vence o `[hidden] { display: none }`
+   da folha do navegador: sem esta regra o guia nasceria aberto. */
+#guia-overlay[hidden] {
+  display: none;
+}
+
+#guia-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(2, 6, 23, .7);
+}
+
+#guia {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 100%);
+  max-height: 100%;
+  background: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .5);
+}
+
+#guia-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid #334155;
+  flex: 0 0 auto;
+}
+
+#guia-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 17px;
+  color: #38bdf8;
+}
+
+#guia-corpo {
+  overflow-y: auto;
+  padding: 4px 20px 20px;
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+#guia-corpo section {
+  padding: 16px 0;
+  border-bottom: 1px solid #1e293b;
+}
+
+#guia-corpo section:last-child {
+  border-bottom: 0;
+}
+
+#guia-corpo h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #f1f5f9;
+}
+
+#guia-corpo p {
+  margin: 8px 0;
+}
+
+#guia-corpo ul {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+
+#guia-corpo li {
+  margin: 4px 0;
+}
+
+#guia-corpo code {
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+#guia-corpo kbd {
+  background: #1e293b;
+  border: 1px solid #475569;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 12px;
+}
+
+#guia-corpo .nota {
+  color: #94a3b8;
+  font-size: 12.5px;
+}
+
+.selo-demo {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 50%;
+  background: #0ea5e9;
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+  vertical-align: -3px;
+}
+
+.guia-tabela {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+}
+
+.guia-tabela th,
+.guia-tabela td {
+  border: 1px solid #334155;
+  padding: 7px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.guia-tabela th {
+  background: #1e293b;
+  color: #94a3b8;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.guia-exemplo {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0;
+  flex-wrap: wrap;
+}
+
+.guia-exemplo pre {
+  flex: 1;
+  min-width: 240px;
+  margin: 0;
+  padding: 12px;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  font: 12px/1.5 Consolas, "Courier New", monospace;
+  color: #cbd5e1;
+  overflow-x: auto;
+}
+
+.guia-seta {
+  color: #38bdf8;
+  font-size: 22px;
+  flex: 0 0 auto;
 }
