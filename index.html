@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Blocky PDF Editor</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://unpkg.com/blockly@10.4.3/blockly_compressed.js"></script>
+  <script src="https://unpkg.com/blockly@10.4.3/msg/pt-br.js"></script>
+</head>
+<body>
+  <header id="toolbar">
+    <span class="app-title">Blocky PDF Editor</span>
+    <button id="btnOpenPdf" class="btn">Abrir PDF</button>
+    <button id="btnSelectMode" class="btn toggle" aria-pressed="false">Modo Seleção: OFF</button>
+    <span class="spacer"></span>
+    <button id="btnExport" class="btn">Exportar Texto</button>
+    <button id="btnSave" class="btn">Salvar Projeto</button>
+    <button id="btnSaveFull" class="btn" title="Inclui os PDFs no arquivo: maior, mas reabre em qualquer computador">Salvar com PDFs</button>
+    <button id="btnLoad" class="btn">Abrir Projeto</button>
+  </header>
+
+  <main id="main">
+    <section id="pdf-panel">
+      <div id="relink-bar" hidden>
+        <span id="relink-text"></span>
+        <button type="button" id="relink-action" class="btn"></button>
+        <button type="button" id="relink-skip" class="btn ghost">Agora não</button>
+      </div>
+      <div id="pdf-placeholder">
+        <div class="placeholder-box">
+          <div class="placeholder-title">Nenhum PDF carregado</div>
+          <div class="placeholder-text">Arraste um arquivo PDF para esta área<br>ou clique em <strong>Abrir PDF</strong></div>
+        </div>
+      </div>
+      <div id="pdf-pages"></div>
+    </section>
+
+    <div id="splitter" title="Arraste para redimensionar"></div>
+
+    <section id="blockly-panel">
+      <div id="blocklyDiv"></div>
+    </section>
+  </main>
+
+  <input type="file" id="pdfFileInput" accept="application/pdf,.pdf" multiple hidden>
+  <input type="file" id="projectFileInput" accept="application/json,.json" hidden>
+
+  <script src="app.js"></script>
+</body>
+</html>

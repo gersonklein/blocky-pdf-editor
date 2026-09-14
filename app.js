@@ -1,0 +1,1727 @@
+/* global pdfjsLib, Blockly */
+
+"use strict";
+
+// As libs vêm de CDN. Se uma delas não carregar (offline, rede da empresa,
+// bloqueador), o antigo acesso direto a `pdfjsLib` aqui em cima estourava um
+// ReferenceError na primeira linha do arquivo: nada mais era definido e a
+// toolbar inteira ficava sem listeners — clicar em "Abrir PDF" não fazia nada,
+// sem nenhuma pista para o usuário.
+const LIB_PDFJS = typeof pdfjsLib !== "undefined";
+const LIB_BLOCKLY = typeof Blockly !== "undefined";
+
+if (LIB_PDFJS) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
+
+// ---------------------------------------------------------------
+// Estado global
+// ---------------------------------------------------------------
+let selectionMode = false;
+let workspace = null;
+
+// Paleta cíclica de cores: uma por PDF aberto. `hex` colore borda/swatch/bloco,
+// `soft` é a versão translúcida usada em ::selection e no overlay de extração.
+const PDF_COLOR_PALETTE = [
+  { hex: "#2563eb", soft: "rgba(37,99,235,.45)" },
+  { hex: "#16a34a", soft: "rgba(22,163,74,.45)" },
+  { hex: "#d97706", soft: "rgba(217,119,6,.45)" },
+  { hex: "#db2777", soft: "rgba(219,39,119,.45)" },
+  { hex: "#7c3aed", soft: "rgba(124,58,237,.45)" },
+  { hex: "#0891b2", soft: "rgba(8,145,178,.45)" },
+  { hex: "#dc2626", soft: "rgba(220,38,38,.45)" },
+  { hex: "#65a30d", soft: "rgba(101,163,13,.45)" },
+];
+let paletteIndex = 0;
+function nextPdfColor() {
+  return PDF_COLOR_PALETTE[paletteIndex++ % PDF_COLOR_PALETTE.length];
+}
+
+// O corpo do bloco recebe o `hex` do PDF, mas o campo de texto do Blockly
+// desenha um retangulo branco por cima que cobre quase toda a area: sobrava uma
+// moldura de poucos pixels e o bloco nao lia como sendo da cor do PDF. Pintar
+// esse retangulo com a mesma mistura que o realce da selecao usa (a cor a 45%
+// sobre o branco da pagina) faz o bloco e o trecho selecionado ficarem do mesmo
+// tom.
+const PDF_TINT_ALPHA = 0.45;
+
+function tintFromHex(hex, alpha = PDF_TINT_ALPHA) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex).trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const mix = (c) => Math.round(255 + (c - 255) * alpha);
+  return `rgb(${mix((n >> 16) & 255)}, ${mix((n >> 8) & 255)}, ${mix(n & 255)})`;
+}
+
+// Diferente de tintFromHex, que devolve cor solida (a mistura com branco que
+// substitui o fundo branco do campo do bloco), aqui a cor precisa ser mesmo
+// translucida: a marca fica sobre o texto renderizado do PDF, e um preenchimento
+// solido escondia o trecho em vez de destaca-lo.
+function rgbaFromHex(hex, alpha) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex).trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+// Sobrevive aos re-renders do Blockly (que recriam os filhos do bloco): a
+// custom property fica no <g> raiz, que persiste, e o CSS a le nos descendentes.
+function applyPdfTint(block) {
+  if (!block || !block.pdfMeta || !block.pdfMeta.color) return;
+  const root = block.getSvgRoot();
+  if (!root) return;
+  const tint = tintFromHex(block.pdfMeta.color);
+  if (!tint) return;
+  root.style.setProperty("--pdf-block-tint", tint);
+  root.classList.add("pdf-tinted");
+}
+
+let pdfIdSeq = 0;
+const openPdfs = new Map(); // id -> { id, name, color, pdfDoc, cardEl, pagesEl }
+
+// Canvas livre dos PDFs: pan/zoom independentes do zoom do Blockly, e
+// posicionamento/z-index dos embeds arrastáveis.
+let panX = 0;
+let panY = 0;
+let zoomLevel = 1;
+const MIN_ZOOM = 0.3;
+const MAX_ZOOM = 2.5;
+const EMBED_WIDTH = 420;
+// Resolução máxima do bitmap da página, em pixels de canvas por pixel de
+// layout. Limita o custo de memória ao ampliar muito.
+const MAX_RENDER_SCALE = 4;
+let topZ = 1;
+let placeCounter = 0;
+
+// MIME type customizado usado para carregar a origem (PDF/cor/retângulos) do
+// arraste dentro do próprio dataTransfer — evita depender de uma variável de
+// módulo cujo timing entre dragstart/drop pode não ser confiável.
+const DRAG_META_TYPE = "application/x-pdf-block-meta";
+
+// Espelho do meta do arraste em curso, usado quando o dataTransfer não devolve
+// o tipo customizado no drop. Ver o comentário em initPdfTextDrag().
+let lastDragMeta = null;
+
+// ---------------------------------------------------------------
+// Atalhos de DOM
+// ---------------------------------------------------------------
+const $ = (sel) => document.querySelector(sel);
+const pdfPanel = $("#pdf-panel");
+const pdfPages = $("#pdf-pages");
+const pdfPlaceholder = $("#pdf-placeholder");
+const blocklyPanel = $("#blockly-panel");
+const blocklyDiv = $("#blocklyDiv");
+const btnSelectMode = $("#btnSelectMode");
+
+// ---------------------------------------------------------------
+// Toast (feedback rápido)
+// ---------------------------------------------------------------
+let toastHost = null;
+function toast(msg) {
+  if (!toastHost) {
+    toastHost = document.createElement("div");
+    toastHost.className = "toast-host";
+    document.body.appendChild(toastHost);
+  }
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = msg;
+  toastHost.appendChild(t);
+  requestAnimationFrame(() => t.classList.add("show"));
+  setTimeout(() => {
+    t.classList.remove("show");
+    setTimeout(() => t.remove(), 300);
+  }, 2400);
+}
+
+// ---------------------------------------------------------------
+// Crachas de acesso a arquivo (File System Access API)
+//
+// O projeto "leve" guarda so o nome do PDF, e o navegador nao pode abrir um
+// arquivo do disco a partir do nome -- e uma trava de seguranca do Chrome. O
+// que da para guardar e um FileSystemFileHandle: uma autorizacao, nao o
+// conteudo. Ele nao e serializavel em JSON, entao mora no IndexedDB, preso a
+// este navegador; o .json continua portatil e cai no seletor de arquivos em
+// qualquer outra maquina.
+// ---------------------------------------------------------------
+const IDB_NAME = "blocky-pdf-editor";
+const IDB_STORE = "file-handles";
+const TEM_FS_API = typeof window.showOpenFilePicker === "function";
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Toda leitura/escrita e best-effort: modo anonimo, cota cheia ou IndexedDB
+// desabilitado nao podem impedir de abrir um PDF.
+async function idbGet(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, "readonly").objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn("[handles] leitura falhou:", err);
+    return null;
+  }
+}
+
+async function idbSet(key, value) {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn("[handles] gravacao falhou:", err);
+  }
+}
+
+// Identifica o arquivo em si, nao o PDF dentro deste projeto: o mesmo arquivo
+// aberto em dois projetos reaproveita o mesmo cracha.
+function fileKeyOf(file) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+// ---------------------------------------------------------------
+// Download helper
+// ---------------------------------------------------------------
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ---------------------------------------------------------------
+// Campo de texto do bloco
+// ---------------------------------------------------------------
+// Largura máxima do texto dentro do bloco. A leitura quebra as linhas nessa
+// largura e a caixa de edição herda a mesma largura do bloco, então o texto
+// não se reorganiza ao abrir o editor.
+const BLOCK_TEXT_WIDTH = 340;
+
+let measureCtx = null;
+function measureText(text, font) {
+  if (!measureCtx) {
+    measureCtx = document.createElement("canvas").getContext("2d");
+  }
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+
+// Quebra por largura medida (e não por contagem de caracteres) para bater com
+// o critério que o <textarea> do editor usa.
+function wrapToWidth(text, font, maxPx) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    let cur = "";
+    for (const word of line.split(" ")) {
+      const test = cur ? cur + " " + word : word;
+      if (cur && measureText(test, font) > maxPx) {
+        out.push(cur);
+        cur = word;
+      } else {
+        cur = test;
+      }
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
+// A classe estende `Blockly.FieldMultilineInput`, então não pode ser avaliada
+// enquanto o Blockly não existir: como declaração de topo, um CDN fora do ar
+// derrubava o arquivo inteiro na primeira linha e a toolbar ficava sem nenhum
+// listener. Agora ela nasce sob demanda, dentro de `defineBlocks()`.
+let BlockTextField = null;
+
+function ensureBlockTextField() {
+  if (BlockTextField) return BlockTextField;
+
+  BlockTextField = class extends Blockly.FieldMultilineInput {
+    constructor(value) {
+      super(value);
+      // Por padrão o Blockly corta cada linha em 50 caracteres e mostra "...".
+      // Era isso que fazia o bloco mostrar um texto na leitura e outro, bem
+      // maior, ao abrir o editor.
+      this.maxDisplayLength = Infinity;
+    }
+
+    fieldFont() {
+      const c = this.getConstants();
+      return `${c.FIELD_TEXT_FONTWEIGHT} ${c.FIELD_TEXT_FONTSIZE}pt ${c.FIELD_TEXT_FONTFAMILY}`;
+    }
+
+    getDisplayText_() {
+      const raw = this.getText();
+      if (!raw) return Blockly.Field.NBSP;
+
+      const font = this.fieldFont();
+      // O bloco fica com a largura da linha mais larga, e é essa largura que a
+      // caixa de edição recebe. Reaplicar a quebra sobre ela faz os dois
+      // convergirem para o mesmo ponto de corte.
+      let width = BLOCK_TEXT_WIDTH;
+      let lines = wrapToWidth(raw, font, width);
+      for (let pass = 0; pass < 2; pass++) {
+        const widest = Math.max(...lines.map((l) => measureText(l, font)));
+        if (widest >= width - 0.5) break;
+        width = widest;
+        lines = wrapToWidth(raw, font, width);
+      }
+
+      let out = lines
+        .map((l) => l.replace(/\s/g, Blockly.Field.NBSP))
+        .join("\n");
+      const block = this.getSourceBlock();
+      if (block && block.RTL) out += "\u200F";
+      return out;
+    }
+
+    // Durante a edição o Blockly ignora o texto exibido e dimensiona o campo
+    // pela linha mais longa do valor cru, sem quebra: o bloco esticava para a
+    // largura do parágrafo inteiro no instante do clique. Aqui ele continua
+    // usando a medida do texto quebrado, então a caixa de edição nasce com a
+    // mesma largura da leitura e quebra nos mesmos pontos.
+    updateSize_() {
+      const editando = this.isBeingEdited_;
+      this.isBeingEdited_ = false;
+      try {
+        super.updateSize_();
+      } finally {
+        this.isBeingEdited_ = editando;
+      }
+    }
+  };
+
+  return BlockTextField;
+}
+
+// ---------------------------------------------------------------
+// Definição do bloco de texto
+// ---------------------------------------------------------------
+function defineBlocks() {
+  ensureBlockTextField();
+
+  Blockly.Blocks["pdf_text"] = {
+    init: function () {
+      this.appendDummyInput().appendField(
+        new BlockTextField("Digite o texto aqui..."),
+        "TEXT"
+      );
+      this.setPreviousStatement(true, null);
+      this.setNextStatement(true, null);
+      this.setColour(160); // cor padrão para blocos criados manualmente (toolbox)
+      this.setTooltip(
+        "Bloco de texto. Arraste para mover, encaixe para ordenar, edite o conteúdo clicando nele."
+      );
+    },
+    // Persiste a cor/origem do PDF junto ao bloco (setColour em tempo de
+    // execução não é salvo automaticamente pela serialização do Blockly).
+    saveExtraState: function () {
+      return this.pdfMeta ? { ...this.pdfMeta } : null;
+    },
+    loadExtraState: function (state) {
+      if (!state) return;
+      this.pdfMeta = state;
+      if (state.color) this.setColour(state.color);
+    },
+  };
+}
+
+// ---------------------------------------------------------------
+// Inicialização do Blockly
+// ---------------------------------------------------------------
+function initBlockly() {
+  defineBlocks();
+
+  const toolbox = {
+    kind: "flyoutToolbox",
+    contents: [{ kind: "block", type: "pdf_text" }],
+  };
+
+  workspace = Blockly.inject(blocklyDiv, {
+    toolbox: toolbox,
+    trashcan: true,
+    zoom: {
+      controls: true,
+      wheel: true,
+      startScale: 1,
+      maxScale: 2,
+      minScale: 0.4,
+      pinch: true,
+    },
+    move: {
+      scrollbars: { horizontal: true, vertical: true },
+      drag: true,
+      wheel: true,
+    },
+    grid: { spacing: 20, length: 3, colour: "#ccc", snap: true },
+  });
+
+  window.addEventListener("resize", () => Blockly.svgResize(workspace));
+}
+
+// ---------------------------------------------------------------
+// Cria um bloco pdf_text na posição (de tela) onde foi solto
+// ---------------------------------------------------------------
+function createTextBlockAt(text, clientX, clientY, meta) {
+  const clean = text.trim();
+  if (!clean) {
+    toast("A seleção está vazia — nada para criar.");
+    return null;
+  }
+
+  const wsCoord = Blockly.utils.svgMath.screenToWsCoordinates(
+    workspace,
+    new Blockly.utils.Coordinate(clientX, clientY)
+  );
+
+  // Agrupa os eventos: criar + posicionar o bloco desfaz em um Ctrl+Z só.
+  Blockly.Events.setGroup(true);
+  let block;
+  try {
+    block = workspace.newBlock("pdf_text");
+    block.setFieldValue(clean, "TEXT");
+    if (meta && meta.color) {
+      block.pdfMeta = { pdfId: meta.pdfId, color: meta.color };
+      block.setColour(meta.color);
+    }
+    block.initSvg();
+    block.render();
+    applyPdfTint(block);
+    block.moveTo(wsCoord);
+    block.select();
+  } finally {
+    Blockly.Events.setGroup(false);
+  }
+
+  toast("Bloco criado!");
+  return block;
+}
+
+// ---------------------------------------------------------------
+// Drag & drop de TEXTO sobre o workspace Blockly
+// ---------------------------------------------------------------
+function isTextDrag(e) {
+  const types = Array.from(e.dataTransfer ? e.dataTransfer.types : []);
+  return types.includes("text/plain") && !types.includes("Files");
+}
+
+function initBlocklyDrop() {
+  blocklyDiv.addEventListener("dragover", (e) => {
+    if (!isTextDrag(e)) return;
+    e.preventDefault();
+    if (selectionMode) {
+      e.dataTransfer.dropEffect = "copy";
+      blocklyPanel.classList.add("drop-highlight");
+    }
+  });
+
+  // `dragleave` também borbulha dos descendentes (o SVG do Blockly), então só
+  // limpa o destaque quando o ponteiro sai do painel de verdade.
+  blocklyDiv.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget && blocklyDiv.contains(e.relatedTarget)) return;
+    blocklyPanel.classList.remove("drop-highlight");
+  });
+
+  // Arraste cancelado (Esc / solto fora) nunca dispara `drop`.
+  window.addEventListener("dragend", () => {
+    blocklyPanel.classList.remove("drop-highlight");
+  });
+
+  blocklyDiv.addEventListener("drop", (e) => {
+    if (!isTextDrag(e)) return;
+    e.preventDefault();
+    blocklyPanel.classList.remove("drop-highlight");
+
+    if (!selectionMode) {
+      toast('Ative o "Modo Seleção" na barra superior para criar blocos.');
+      return;
+    }
+
+    const text = e.dataTransfer.getData("text/plain");
+    const rawMeta = e.dataTransfer.getData(DRAG_META_TYPE);
+    let drag = null;
+    if (rawMeta) {
+      try {
+        drag = JSON.parse(rawMeta);
+      } catch (_) {
+        drag = null;
+      }
+    }
+    if (!drag) drag = lastDragMeta;
+
+    const meta = drag ? { color: drag.color, pdfId: drag.pdfId } : null;
+    const block = createTextBlockAt(text, e.clientX, e.clientY, meta);
+
+    if (block && drag) {
+      const info = openPdfs.get(drag.pdfId);
+      for (const m of drag.marks) applyMarks(info, m.pageKey, m.relRects);
+    }
+  });
+}
+
+// ---------------------------------------------------------------
+// Marca (tracejado) a área da página de onde um texto foi extraído
+// ---------------------------------------------------------------
+// Sublinha, na cor do PDF, o trecho que ja foi levado para um bloco.
+//
+// A cor vem por parametro e e escrita no proprio elemento. Antes o CSS a lia
+// por heranca, com `var(--pdf-color, #16a34a)`: bastava a marca ficar fora do
+// card que define a variavel para tudo cair no fallback -- verde, em todos os
+// PDFs, independentemente da cor de cada um.
+// Ponto unico por onde um sublinhado passa: guarda no `info` (fonte do que sera
+// salvo) e desenha na pagina. Usado tanto no drop quanto ao reabrir um projeto.
+function applyMarks(info, pageKey, rects, registrar = true) {
+  if (!info || !rects || !rects.length) return;
+  if (registrar) {
+    const existente = info.marks.find((m) => m.pageKey === pageKey);
+    if (existente) existente.rects.push(...rects);
+    else info.marks.push({ pageKey, rects: rects.slice() });
+  }
+  const pageWrapper = info.cardEl.querySelector(
+    `.pdf-page[data-page-key="${CSS.escape(pageKey)}"]`
+  );
+  if (pageWrapper) markExtraction(pageWrapper, rects, info.color.hex);
+}
+
+function markExtraction(pageWrapper, relRects, color) {
+  let overlay = pageWrapper.querySelector(":scope > .extraction-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.className = "extraction-overlay";
+    pageWrapper.appendChild(overlay);
+  }
+  for (const r of relRects) {
+    const mark = document.createElement("div");
+    mark.className = "extraction-mark";
+    mark.style.left = r.left + "px";
+    mark.style.top = r.top + "px";
+    mark.style.width = r.width + "px";
+    mark.style.height = r.height + "px";
+    if (color) {
+      mark.style.setProperty("--mark-color", color);
+      const tint = rgbaFromHex(color, 0.12);
+      if (tint) mark.style.setProperty("--mark-tint", tint);
+    }
+    overlay.appendChild(mark);
+  }
+}
+
+// ---------------------------------------------------------------
+// Arraste de seleção do PDF → bloco Blockly
+// (Usa o arraste nativo do navegador, que já popula dataTransfer
+//  com text/plain quando o usuário arrasta uma seleção de texto.)
+// ---------------------------------------------------------------
+function initPdfTextDrag() {
+  pdfPages.addEventListener("dragstart", (e) => {
+    if (!selectionMode) {
+      e.preventDefault();
+      return;
+    }
+
+    // Ao arrastar uma seleção, `e.target` pode ser o nó de texto onde o
+    // arraste começou, e nó de texto não tem `closest`: a chamada lançava
+    // TypeError, o setData do meta nunca acontecia e o bloco nascia sem cor.
+    const alvo =
+      e.target.nodeType === Node.ELEMENT_NODE ? e.target : e.target.parentElement;
+    const card = alvo ? alvo.closest(".pdf-card") : null;
+    const info = card ? openPdfs.get(card.dataset.pdfId) : null;
+
+    const sel = window.getSelection();
+    const text = sel ? sel.toString().trim() : "";
+    if (!info || !text || !sel.rangeCount) {
+      e.preventDefault();
+      return;
+    }
+
+    const meta = {
+      pdfId: info.id,
+      color: info.color.hex,
+      // Os retângulos da seleção (que pode já não ser válida no drop) viajam
+      // junto, em coordenadas da página de origem, identificada por uma chave
+      // estável (data-page-key).
+      marks: collectSelectionMarks(sel, card),
+    };
+
+    // O meta vai pelos dois caminhos de propósito. O dataTransfer é o correto,
+    // mas basta o navegador descartar o tipo customizado (acontece em alguns
+    // arrastes de seleção nativa) para o drop receber só text/plain — e aí o
+    // bloco caía na cor padrão do `setColour(160)`, verde, para todos os PDFs.
+    // A variável de módulo cobre esse caso; o drop prefere o dataTransfer.
+    lastDragMeta = meta;
+
+    e.dataTransfer.setData("text/plain", text);
+    e.dataTransfer.effectAllowed = "copy";
+    try {
+      e.dataTransfer.setData(DRAG_META_TYPE, JSON.stringify(meta));
+    } catch (err) {
+      console.warn("[drag] meta não coube no dataTransfer:", err);
+    }
+  });
+
+  // `dragend` vem depois do `drop`, então o espelho já cumpriu seu papel aqui.
+  pdfPages.addEventListener("dragend", () => {
+    lastDragMeta = null;
+  });
+}
+
+// Retângulos da seleção → coordenadas locais de cada página do card.
+//
+// A página de cada retângulo é encontrada por geometria, e não por
+// document.elementFromPoint: trechos rolados para fora da área visível do card
+// não são atingidos por hit-test e ficavam sem marcação.
+function collectSelectionMarks(sel, card) {
+  const pages = Array.from(card.querySelectorAll(".pdf-page")).map((el) => ({
+    key: el.dataset.pageKey,
+    rect: el.getBoundingClientRect(),
+  }));
+  const byPage = new Map(); // pageKey -> relRects[]
+
+  for (let i = 0; i < sel.rangeCount; i++) {
+    for (const r of sel.getRangeAt(i).getClientRects()) {
+      if (r.width === 0 || r.height === 0) continue;
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const page = pages.find(
+        (p) =>
+          cx >= p.rect.left &&
+          cx <= p.rect.right &&
+          cy >= p.rect.top &&
+          cy <= p.rect.bottom
+      );
+      if (!page) continue;
+      // getBoundingClientRect() já inclui o zoom do canvas; as marcas ficam
+      // dentro da página, que é escalada junto — logo precisam ser gravadas
+      // sem o zoom, senão saem deslocadas e menores.
+      if (!byPage.has(page.key)) byPage.set(page.key, []);
+      byPage.get(page.key).push({
+        left: (r.left - page.rect.left) / zoomLevel,
+        top: (r.top - page.rect.top) / zoomLevel,
+        width: r.width / zoomLevel,
+        height: r.height / zoomLevel,
+      });
+    }
+  }
+
+  return Array.from(byPage, ([pageKey, rects]) => ({
+    pageKey,
+    relRects: mergeRects(rects),
+  }));
+}
+
+// Uma mesma linha rende retângulos quase idênticos (caixa do span + caixa do
+// nó de texto); sobrepostos, escureciam a marcação. Funde-os em um só.
+function overlapRatio(a, b) {
+  const w =
+    Math.min(a.left + a.width, b.left + b.width) - Math.max(a.left, b.left);
+  const h =
+    Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top);
+  if (w <= 0 || h <= 0) return 0;
+  return (w * h) / Math.min(a.width * a.height, b.width * b.height);
+}
+
+function mergeRects(rects) {
+  const out = [];
+  for (const r of rects) {
+    const hit = out.find((o) => overlapRatio(o, r) > 0.6);
+    if (!hit) {
+      out.push({ ...r });
+      continue;
+    }
+    const right = Math.max(hit.left + hit.width, r.left + r.width);
+    const bottom = Math.max(hit.top + hit.height, r.top + r.height);
+    hit.left = Math.min(hit.left, r.left);
+    hit.top = Math.min(hit.top, r.top);
+    hit.width = right - hit.left;
+    hit.height = bottom - hit.top;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------
+// Cards de PDF (um por documento aberto)
+// ---------------------------------------------------------------
+function createPdfCard(id, name, color) {
+  const card = document.createElement("div");
+  card.className = "pdf-card";
+  card.dataset.pdfId = id;
+  card.style.setProperty("--pdf-color", color.hex);
+  card.style.setProperty("--pdf-color-soft", color.soft);
+
+  const header = document.createElement("div");
+  header.className = "pdf-card-header";
+
+  const swatch = document.createElement("span");
+  swatch.className = "pdf-color-swatch";
+
+  const title = document.createElement("span");
+  title.className = "pdf-card-title";
+  title.textContent = name;
+  title.title = name;
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "pdf-card-close";
+  closeBtn.setAttribute("aria-label", "Fechar PDF");
+  closeBtn.textContent = "×";
+  closeBtn.addEventListener("click", () => closePdf(id));
+
+  header.append(swatch, title, closeBtn);
+
+  const pagesEl = document.createElement("div");
+  pagesEl.className = "pdf-card-pages";
+
+  card.append(header, pagesEl);
+  return { card, pagesEl, header };
+}
+
+// ---------------------------------------------------------------
+// Canvas livre: pan/zoom do painel e arraste dos embeds de PDF
+// ---------------------------------------------------------------
+function applyCanvasTransform() {
+  pdfPages.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`;
+}
+
+function screenToCanvas(clientX, clientY) {
+  const rect = pdfPanel.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left - panX) / zoomLevel,
+    y: (clientY - rect.top - panY) / zoomLevel,
+  };
+}
+
+// Posição do próximo embed: sob o cursor (drop de arquivo) ou em cascata a
+// partir do centro do que está visível agora (botão "Abrir PDF").
+function nextEmbedPosition(clientX, clientY) {
+  const cascade = 28 * (placeCounter++ % 10);
+  let base;
+  if (typeof clientX === "number") {
+    base = screenToCanvas(clientX, clientY);
+    base.x -= EMBED_WIDTH / 2;
+    base.y -= 24;
+  } else {
+    const rect = pdfPanel.getBoundingClientRect();
+    base = screenToCanvas(
+      rect.left + rect.width / 2,
+      rect.top + rect.height / 2
+    );
+    base.x -= EMBED_WIDTH / 2;
+    base.y -= 200;
+  }
+  return { x: base.x + cascade, y: base.y + cascade };
+}
+
+// Os listeners de mousemove/mouseup vivem só durante o arraste: antes eram
+// registrados em `window` por card e nunca removidos, acumulando um par a cada
+// PDF aberto (e sobrevivendo ao fechamento do card).
+function makeCardDraggable(card, header) {
+  header.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest(".pdf-card-close")) return;
+    e.preventDefault();
+
+    card.style.zIndex = ++topZ;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const origLeft = parseFloat(card.style.left) || 0;
+    const origTop = parseFloat(card.style.top) || 0;
+    document.body.style.userSelect = "none";
+
+    const onMove = (ev) => {
+      card.style.left = origLeft + (ev.clientX - startX) / zoomLevel + "px";
+      card.style.top = origTop + (ev.clientY - startY) / zoomLevel + "px";
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  });
+}
+
+function initPdfCanvasPan() {
+  let panning = false;
+  let startX, startY, startPanX, startPanY;
+
+  pdfPanel.addEventListener("mousedown", (e) => {
+    if (e.target.closest(".pdf-card")) return; // embed cuida do próprio arraste
+    if (e.button !== 0) return;
+    panning = true;
+    pdfPanel.classList.add("panning");
+    startX = e.clientX;
+    startY = e.clientY;
+    startPanX = panX;
+    startPanY = panY;
+    document.body.style.userSelect = "none";
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!panning) return;
+    panX = startPanX + (e.clientX - startX);
+    panY = startPanY + (e.clientY - startY);
+    applyCanvasTransform();
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!panning) return;
+    panning = false;
+    pdfPanel.classList.remove("panning");
+    document.body.style.userSelect = "";
+    scheduleResolutionRefresh(); // páginas que entraram na tela
+  });
+}
+
+function initPdfCanvasWheel() {
+  pdfPanel.addEventListener(
+    "wheel",
+    (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const rect = pdfPanel.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const prevZoom = zoomLevel;
+        zoomLevel = Math.min(
+          MAX_ZOOM,
+          Math.max(MIN_ZOOM, zoomLevel * (e.deltaY < 0 ? 1.1 : 0.9))
+        );
+        panX = cx - (cx - panX) * (zoomLevel / prevZoom);
+        panY = cy - (cy - panY) * (zoomLevel / prevZoom);
+        applyCanvasTransform();
+        scheduleResolutionRefresh();
+        return;
+      }
+
+      // Sem ctrl a roda desloca o canvas (shift = horizontal). O painel tem
+      // overflow:hidden, então antes o scroll simplesmente não fazia nada.
+      // Dentro de um card que ainda pode rolar, o scroll nativo tem prioridade.
+      const scroller = e.target.closest && e.target.closest(".pdf-card-pages");
+      if (scroller && scroller.scrollHeight > scroller.clientHeight) return;
+
+      e.preventDefault();
+      if (e.shiftKey) {
+        panX -= e.deltaY;
+      } else {
+        panX -= e.deltaX;
+        panY -= e.deltaY;
+      }
+      applyCanvasTransform();
+      scheduleResolutionRefresh();
+    },
+    { passive: false }
+  );
+}
+
+function closePdf(id, silent) {
+  const info = openPdfs.get(id);
+  if (!info) return;
+  info.closed = true; // interrompe o laço de renderização em loadPdf()
+  info.cardEl.remove();
+  try {
+    info.pdfDoc.destroy();
+  } catch (_) {
+    /* ignore */
+  }
+  openPdfs.delete(id);
+  if (openPdfs.size === 0) pdfPlaceholder.style.display = "";
+  if (!silent) toast(`PDF removido: ${info.name}`);
+}
+
+// ---------------------------------------------------------------
+// Carregamento e renderização de PDFs (múltiplos, um card por PDF)
+// ---------------------------------------------------------------
+// `restore` vem do "Abrir Projeto": traz o id, a cor e a posicao originais, para
+// que o projeto reabra identico. O id precisa ser o mesmo porque os blocos
+// referenciam o PDF de origem por ele, e as chaves das paginas (`data-page-key`,
+// usadas para reancorar os sublinhados) sao derivadas dele.
+async function loadPdf(arrayBuffer, fileName, opts = {}) {
+  const { dropPos = null, restore = null, fileKey = null } = opts;
+  if (!LIB_PDFJS) {
+    toast("PDF.js não carregou (sem internet?). Recarregue a página.");
+    return null;
+  }
+
+  // O pdf.js transfere o ArrayBuffer para o worker e o deixa destacado (byteLength
+  // 0). A copia e feita antes, senao nao haveria mais bytes para salvar no projeto.
+  const bytes = new Uint8Array(arrayBuffer.slice(0));
+
+  let pdfDoc;
+  try {
+    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  } catch (err) {
+    console.error(err);
+    toast(`Não foi possível abrir "${fileName}".`);
+    return null;
+  }
+
+  const id = restore ? restore.id : "pdf-" + ++pdfIdSeq;
+  const color = restore ? restore.color : nextPdfColor();
+  const { card, pagesEl, header } = createPdfCard(id, fileName, color);
+
+  if (restore) {
+    card.style.left = restore.left + "px";
+    card.style.top = restore.top + "px";
+    card.style.zIndex = restore.z;
+    topZ = Math.max(topZ, restore.z);
+  } else {
+    const pos = dropPos
+      ? nextEmbedPosition(dropPos.x, dropPos.y)
+      : nextEmbedPosition();
+    card.style.left = pos.x + "px";
+    card.style.top = pos.y + "px";
+    card.style.zIndex = ++topZ;
+  }
+
+  pdfPages.appendChild(card);
+  pdfPlaceholder.style.display = "none";
+  makeCardDraggable(card, header);
+  card.addEventListener("mousedown", () => {
+    card.style.zIndex = ++topZ;
+  });
+
+  const info = {
+    id,
+    name: fileName,
+    color,
+    pdfDoc,
+    bytes,
+    // Chave do cracha de acesso, quando o arquivo veio pelo picker. Vai no
+    // projeto leve para permitir religar sem procurar o arquivo de novo.
+    fileKey: fileKey || (restore ? restore.fileKey : null) || null,
+    cardEl: card,
+    pagesEl,
+    pages: [],
+    // Sublinhados ja aplicados, por pagina. Ficam aqui, e nao so no DOM, porque
+    // e daqui que "Salvar Projeto" os le.
+    marks: [],
+    closed: false,
+  };
+  openPdfs.set(id, info);
+
+  // Páginas reveladas ao rolar o card também precisam ganhar resolução.
+  pagesEl.addEventListener("scroll", scheduleResolutionRefresh, { passive: true });
+
+  const availWidth = EMBED_WIDTH - 24; // largura fixa do embed, não do painel
+
+  // Fechar o card destrói o documento; sem estas checagens as páginas
+  // pendentes seguiam renderizando e a promise estourava com
+  // "Transport destroyed" — rejeição não tratada no console.
+  try {
+    for (let n = 1; n <= pdfDoc.numPages; n++) {
+      if (info.closed) return null;
+      const page = await pdfDoc.getPage(n);
+      if (info.closed) return null;
+      await renderPage(page, n, availWidth, pagesEl, id, info);
+    }
+  } catch (err) {
+    if (info.closed) return null; // erro esperado: documento destruído no meio
+    console.error(err);
+    toast(`Falha ao renderizar "${fileName}".`);
+    return null;
+  }
+
+  // Só agora as páginas existem no DOM e os sublinhados têm onde ancorar.
+  if (restore) {
+    for (const m of restore.marks || []) {
+      applyMarks(info, m.pageKey, m.rects);
+    }
+    if (restore.scrollTop) pagesEl.scrollTop = restore.scrollTop;
+    return info;
+  }
+
+  toast(`PDF carregado: ${fileName} (${pdfDoc.numPages} página(s)).`);
+  return info;
+}
+
+// Resolução de bitmap desejada para o zoom atual do canvas. O <canvas> tem
+// tamanho CSS fixo e é esticado pelo transform do painel: sem redesenhar, o
+// bitmap é ampliado e o texto sai borrado.
+function targetRenderScale() {
+  const dpr = window.devicePixelRatio || 1;
+  return Math.min(MAX_RENDER_SCALE, Math.max(1, dpr * zoomLevel));
+}
+
+async function renderPage(page, pageNumber, availWidth, container, pdfId, info) {
+  const baseViewport = page.getViewport({ scale: 1 });
+  let scale = availWidth / baseViewport.width;
+  scale = Math.min(3, Math.max(0.4, scale));
+  const viewport = page.getViewport({ scale });
+
+  const label = document.createElement("div");
+  label.className = "page-number";
+  label.textContent = "Página " + pageNumber;
+  container.appendChild(label);
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "pdf-page";
+  wrapper.dataset.pageKey = pdfId + "-" + pageNumber;
+  container.appendChild(wrapper);
+
+  const renderScale = targetRenderScale();
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.floor(viewport.width * renderScale);
+  canvas.height = Math.floor(viewport.height * renderScale);
+  canvas.style.width = Math.floor(viewport.width) + "px";
+  canvas.style.height = Math.floor(viewport.height) + "px";
+  wrapper.appendChild(canvas);
+
+  const ctx = canvas.getContext("2d");
+  const renderTask = page.render({
+    canvasContext: ctx,
+    viewport: viewport,
+    transform: [renderScale, 0, 0, renderScale, 0, 0],
+  });
+
+  // Camada de texto selecionável/arrastável
+  const textLayerDiv = document.createElement("div");
+  textLayerDiv.className = "textLayer";
+  textLayerDiv.style.setProperty("--scale-factor", scale);
+  wrapper.appendChild(textLayerDiv);
+
+  const textContent = await page.getTextContent();
+  const textTask = pdfjsLib.renderTextLayer({
+    textContentSource: textContent,
+    container: textLayerDiv,
+    viewport: viewport,
+  });
+
+  await Promise.all([renderTask.promise, textTask.promise]);
+
+  // Guardado para poder redesenhar a página em outra resolução ao dar zoom.
+  if (info) {
+    info.pages.push({
+      page,
+      wrapper,
+      canvas,
+      baseScale: scale,
+      renderScale,
+      pendingScale: renderScale,
+      task: null,
+    });
+    // A página pode ter terminado depois de um zoom: garante que ela alcance
+    // a resolução atual em vez de ficar na que valia quando começou.
+    scheduleResolutionRefresh();
+  }
+}
+
+// Redesenha o bitmap da página na resolução pedida, sem piscar: o desenho vai
+// para um canvas solto e só substitui o antigo quando termina.
+async function rerenderPageCanvas(entry, renderScale) {
+  // Esta resolução já está pronta ou a caminho. Sem esta reserva — feita
+  // antes de qualquer await — pedidos seguidos de zoom cancelavam uns aos
+  // outros indefinidamente e a página nunca chegava a ficar nítida.
+  if (entry.pendingScale === renderScale) return;
+  entry.pendingScale = renderScale;
+
+  // O pdf.js não aceita dois desenhos simultâneos da mesma página: cancela o
+  // anterior e espera ele de fato terminar antes de começar o novo.
+  if (entry.task) {
+    try {
+      entry.task.cancel();
+    } catch (_) {
+      /* ignore */
+    }
+    try {
+      await entry.task.promise;
+    } catch (_) {
+      /* cancelamento é o caminho esperado */
+    }
+    entry.task = null;
+  }
+
+  const viewport = entry.page.getViewport({ scale: entry.baseScale });
+  const next = document.createElement("canvas");
+  next.width = Math.floor(viewport.width * renderScale);
+  next.height = Math.floor(viewport.height * renderScale);
+  next.style.width = Math.floor(viewport.width) + "px";
+  next.style.height = Math.floor(viewport.height) + "px";
+
+  const task = entry.page.render({
+    canvasContext: next.getContext("2d"),
+    viewport,
+    transform: [renderScale, 0, 0, renderScale, 0, 0],
+  });
+  entry.task = task;
+
+  try {
+    await task.promise;
+  } catch (_) {
+    // Cancelado por um zoom mais novo, ou documento fechado. Libera a reserva
+    // só se ninguém mais assumiu, para não travar tentativas futuras.
+    if (entry.pendingScale === renderScale) entry.pendingScale = entry.renderScale;
+    return;
+  }
+  if (entry.task !== task) return; // já foi superado por outro pedido
+  entry.task = null;
+  entry.canvas.replaceWith(next);
+  entry.canvas = next;
+  entry.renderScale = renderScale;
+  entry.pendingScale = renderScale;
+}
+
+// Só redesenha páginas visíveis: com vários PDFs abertos, redesenhar tudo a
+// cada passo do zoom travaria a interface.
+let resolutionTimer = null;
+function scheduleResolutionRefresh() {
+  clearTimeout(resolutionTimer);
+  resolutionTimer = setTimeout(refreshPdfResolution, 180);
+}
+
+function refreshPdfResolution() {
+  const target = targetRenderScale();
+  const panelRect = pdfPanel.getBoundingClientRect();
+
+  for (const info of openPdfs.values()) {
+    if (info.closed) continue;
+    for (const entry of info.pages) {
+      // Margem morta: evita redesenhar a cada clique da roda do mouse. Compara
+      // com o desenho em andamento, se houver, para não enfileirar trabalho
+      // repetido enquanto ele não termina.
+      const atual = entry.pendingScale || entry.renderScale;
+      if (target <= atual * 1.1 && target >= atual * 0.6) continue;
+      const r = entry.wrapper.getBoundingClientRect();
+      const visivel =
+        r.bottom > panelRect.top &&
+        r.top < panelRect.bottom &&
+        r.right > panelRect.left &&
+        r.left < panelRect.right;
+      if (!visivel) continue;
+      rerenderPageCanvas(entry, target);
+    }
+  }
+}
+
+function handlePdfFile(file, dropPos, fileKey) {
+  if (!file) return;
+  const isPdf =
+    file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  if (!isPdf) {
+    toast("Por favor, envie um arquivo PDF.");
+    return;
+  }
+  file
+    .arrayBuffer()
+    .then((buf) => loadPdf(buf, file.name, { dropPos, fileKey }))
+    .catch((err) => {
+      console.error(err);
+      toast(`Não foi possível ler "${file.name}".`);
+    });
+}
+
+// Caminho normal do botao "Abrir PDF". Prefere o picker do File System Access
+// porque so ele devolve um handle -- o cracha que permite religar o PDF quando
+// um projeto leve for reaberto. Sem a API (ou se ela falhar), cai no <input
+// type=file> de sempre, e o projeto leve pedira os arquivos na mao.
+async function abrirPdfs() {
+  if (TEM_FS_API) {
+    let handles;
+    try {
+      handles = await window.showOpenFilePicker({
+        multiple: true,
+        types: [{ description: "PDF", accept: { "application/pdf": [".pdf"] } }],
+      });
+    } catch (err) {
+      if (err && err.name === "AbortError") return; // usuário fechou o seletor
+      console.warn("[abrir] picker indisponível, usando o input:", err);
+      $("#pdfFileInput").click();
+      return;
+    }
+    for (const handle of handles) {
+      try {
+        const file = await handle.getFile();
+        const key = fileKeyOf(file);
+        await idbSet(key, handle);
+        handlePdfFile(file, null, key);
+      } catch (err) {
+        console.error("[abrir] falha ao ler o arquivo escolhido:", err);
+        toast("Não foi possível ler um dos arquivos escolhidos.");
+      }
+    }
+    return;
+  }
+  $("#pdfFileInput").click();
+}
+
+function initPdfDrop() {
+  pdfPanel.addEventListener("dragover", (e) => {
+    const types = Array.from(e.dataTransfer ? e.dataTransfer.types : []);
+    if (!types.includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    pdfPanel.classList.add("dragover");
+  });
+
+  pdfPanel.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget && pdfPanel.contains(e.relatedTarget)) return;
+    pdfPanel.classList.remove("dragover");
+  });
+
+  pdfPanel.addEventListener("drop", (e) => {
+    const types = Array.from(e.dataTransfer ? e.dataTransfer.types : []);
+    if (!types.includes("Files")) return;
+    e.preventDefault();
+    pdfPanel.classList.remove("dragover");
+    const pos = { x: e.clientX, y: e.clientY };
+    Array.from(e.dataTransfer.files).forEach((f) => handlePdfFile(f, pos));
+  });
+}
+
+// ---------------------------------------------------------------
+// Impede o navegador de "abrir" arquivos soltos fora do painel
+// ---------------------------------------------------------------
+function initGlobalFileGuard() {
+  const guard = (e) => {
+    const types = Array.from(e.dataTransfer ? e.dataTransfer.types : []);
+    if (types.includes("Files")) e.preventDefault();
+  };
+  window.addEventListener("dragover", guard);
+  window.addEventListener("drop", guard);
+}
+
+// ---------------------------------------------------------------
+// Modo seleção (toggle)
+// ---------------------------------------------------------------
+function setSelectionMode(on) {
+  selectionMode = on;
+  document.body.classList.toggle("selection-mode", on);
+  btnSelectMode.classList.toggle("active", on);
+  btnSelectMode.setAttribute("aria-pressed", String(on));
+  btnSelectMode.textContent = on ? "Modo Seleção: ON" : "Modo Seleção: OFF";
+  if (on) {
+    toast("Modo Seleção ativo: selecione texto no PDF e arraste para o painel de blocos.");
+  }
+}
+
+// ---------------------------------------------------------------
+// Exportar texto montado (blocos de cima para baixo)
+// ---------------------------------------------------------------
+function exportText() {
+  const blocks = workspace.getBlocksByType("pdf_text", false);
+  if (!blocks.length) {
+    toast("Nenhum bloco para exportar.");
+    return;
+  }
+
+  // Percorre pilha por pilha, do topo para baixo, na ordem em que as pilhas
+  // aparecem no workspace. Ordenar a lista achatada pela posição intercalava
+  // pilhas lado a lado e dependia das coordenadas de blocos já encaixados,
+  // que não acompanham a posição real dentro da pilha.
+  const parts = [];
+  for (const top of workspace.getTopBlocks(true)) {
+    for (let b = top; b; b = b.getNextBlock()) {
+      if (b.type !== "pdf_text") continue;
+      const t = (b.getFieldValue("TEXT") || "").trim();
+      if (t) parts.push(t);
+    }
+  }
+
+  const text = parts
+    .join("\n\n");
+
+  if (!text) {
+    toast("Os blocos estão vazios.");
+    return;
+  }
+
+  downloadBlob(
+    new Blob([text], { type: "text/plain;charset=utf-8" }),
+    "texto-blocos.txt"
+  );
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).catch(() => {});
+  }
+  toast("Texto exportado (arquivo .txt + área de transferência).");
+}
+
+// ---------------------------------------------------------------
+// Salvar / carregar projeto
+// ---------------------------------------------------------------
+// Os bytes do PDF vao dentro do proprio .json, em base64. E o que permite
+// reabrir o projeto identico sem depender de os arquivos originais ainda
+// estarem no mesmo lugar do disco -- ao custo de um .json grande (base64
+// cresce ~33% sobre o tamanho somado dos PDFs).
+const PROJECT_FORMAT = "blocky-pdf-editor";
+const PROJECT_VERSION = 3;
+
+function bytesToBase64(bytes) {
+  // Em pedaços: `String.fromCharCode(...bytes)` de uma vez estoura a pilha
+  // em PDFs de poucos MB.
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Separado do download para poder ser exercitado sozinho (e porque salvar e
+// entregar o arquivo sao duas responsabilidades distintas).
+// `embed` decide entre os dois formatos. Sem ele o projeto guarda apenas a
+// referencia de cada PDF (nome, cor, posicao, sublinhados) e fica na casa dos
+// KB; o texto extraido ja vive nos blocos, entao nada do trabalho se perde --
+// o que falta e so a imagem de referencia do painel esquerdo.
+function buildProject(embed) {
+  const pdfs = [];
+  for (const info of openPdfs.values()) {
+    if (info.closed) continue;
+    const p = {
+      id: info.id,
+      name: info.name,
+      color: info.color,
+      fileKey: info.fileKey,
+      left: parseFloat(info.cardEl.style.left) || 0,
+      top: parseFloat(info.cardEl.style.top) || 0,
+      z: parseInt(info.cardEl.style.zIndex, 10) || 1,
+      scrollTop: info.pagesEl.scrollTop,
+      marks: info.marks,
+    };
+    if (embed) p.data = bytesToBase64(info.bytes);
+    pdfs.push(p);
+  }
+
+  return {
+    format: PROJECT_FORMAT,
+    version: PROJECT_VERSION,
+    embedded: !!embed,
+    canvas: { panX, panY, zoom: zoomLevel },
+    pdfs,
+    blocks: Blockly.serialization.workspaces.save(workspace),
+  };
+}
+
+function gravarProjeto(embed) {
+  const projeto = buildProject(embed);
+  const blob = new Blob([JSON.stringify(projeto)], {
+    type: "application/json;charset=utf-8",
+  });
+  downloadBlob(
+    blob,
+    embed ? "projeto-blocos-com-pdfs.json" : "projeto-blocos.json"
+  );
+
+  const n = projeto.pdfs.length;
+  const tamanho =
+    blob.size < 1024 * 1024
+      ? `${Math.max(1, Math.round(blob.size / 1024))} KB`
+      : `${(blob.size / (1024 * 1024)).toFixed(1)} MB`;
+  toast(
+    embed
+      ? `Projeto salvo com ${n} PDF(s) embutido(s): ${tamanho}.`
+      : `Projeto salvo (${tamanho}). Os ${n} PDF(s) são religados ao abrir.`
+  );
+}
+
+function saveProject() {
+  gravarProjeto(false);
+}
+
+function saveProjectWithPdfs() {
+  gravarProjeto(true);
+}
+
+async function loadProject(file) {
+  if (!file) return;
+
+  let projeto;
+  try {
+    projeto = JSON.parse(await file.text());
+  } catch (err) {
+    console.error(err);
+    toast("Arquivo de projeto inválido.");
+    return;
+  }
+
+  // Projetos antigos eram o estado cru do Blockly, sem `format`: mantidos
+  // legiveis, so nao trazem PDFs para restaurar.
+  const novo = projeto && projeto.format === PROJECT_FORMAT;
+  const blocos = novo ? projeto.blocks : projeto;
+
+  esconderBarraReligacao();
+  for (const id of Array.from(openPdfs.keys())) closePdf(id, true);
+
+  try {
+    workspace.clear();
+    if (blocos) Blockly.serialization.workspaces.load(blocos, workspace);
+    // `loadExtraState` roda antes de o bloco ter SVG, entao o tom e aplicado
+    // aqui, com o workspace ja renderizado.
+    workspace.getAllBlocks(false).forEach(applyPdfTint);
+  } catch (err) {
+    console.error(err);
+    toast("Não foi possível carregar os blocos do projeto.");
+    return;
+  }
+
+  if (!novo) {
+    toast("Projeto carregado (formato antigo, sem PDFs).");
+    return;
+  }
+
+  if (projeto.canvas) {
+    panX = projeto.canvas.panX || 0;
+    panY = projeto.canvas.panY || 0;
+    zoomLevel = projeto.canvas.zoom || 1;
+    applyCanvasTransform();
+  }
+
+  const lista = projeto.pdfs || [];
+
+  // Ids e cores dos proximos PDFs abertos nao podem colidir com os restaurados.
+  // Feito antes de qualquer await: um PDF aberto durante a restauracao ja pega
+  // a numeracao correta.
+  for (const p of lista) {
+    const n = parseInt(String(p.id).replace("pdf-", ""), 10);
+    if (Number.isFinite(n)) pdfIdSeq = Math.max(pdfIdSeq, n);
+    const i = PDF_COLOR_PALETTE.findIndex((c) => c.hex === (p.color && p.color.hex));
+    if (i >= 0) paletteIndex = Math.max(paletteIndex, i + 1);
+  }
+
+  // Os que trazem os bytes voltam agora; os demais dependem do disco.
+  const pendentes = [];
+  let falhas = 0;
+  for (const p of lista) {
+    if (!p.data) {
+      pendentes.push(p);
+      continue;
+    }
+    try {
+      const bytes = base64ToBytes(p.data);
+      if (!(await loadPdf(bytes.buffer, p.name, { restore: p }))) falhas++;
+    } catch (err) {
+      console.error(`[projeto] falha ao restaurar "${p.name}":`, err);
+      falhas++;
+    }
+  }
+
+  if (falhas) toast(`${falhas} PDF(s) do projeto não puderam ser abertos.`);
+
+  if (pendentes.length) {
+    await oferecerReligacao(pendentes);
+  } else if (!falhas) {
+    toast(`Projeto carregado: ${lista.length} PDF(s).`);
+  }
+}
+
+// ---------------------------------------------------------------
+// Religacao dos PDFs de um projeto leve
+// ---------------------------------------------------------------
+
+// Restaura um PDF a partir de um File ja em maos.
+async function restaurarPdf(p, file) {
+  const buf = await file.arrayBuffer();
+  return loadPdf(buf, p.name, { restore: p });
+}
+
+// Quais pendentes tem cracha de acesso valido neste navegador. `queryPermission`
+// nao pede nada ao usuario: so informa se a autorizacao ainda vale.
+async function comCrachaDisponivel(pendentes) {
+  if (!TEM_FS_API) return [];
+  const achados = [];
+  for (const p of pendentes) {
+    if (!p.fileKey) continue;
+    const handle = await idbGet(p.fileKey);
+    if (handle) achados.push({ p, handle });
+  }
+  return achados;
+}
+
+async function oferecerReligacao(pendentes) {
+  const comCracha = await comCrachaDisponivel(pendentes);
+  const nomes = pendentes.map((p) => p.name).join(", ");
+
+  if (comCracha.length === pendentes.length && comCracha.length > 0) {
+    // Caminho do "um clique": requestPermission exige um gesto do usuario, e o
+    // clique no botao da barra e esse gesto.
+    mostrarBarraReligacao({
+      texto: `Este projeto usa ${pendentes.length} PDF(s): ${nomes}.`,
+      rotulo: "Restaurar PDFs",
+      acao: async () => {
+        let ok = 0;
+        for (const { p, handle } of comCracha) {
+          try {
+            let perm = await handle.queryPermission({ mode: "read" });
+            if (perm !== "granted") {
+              perm = await handle.requestPermission({ mode: "read" });
+            }
+            if (perm !== "granted") continue;
+            if (await restaurarPdf(p, await handle.getFile())) ok++;
+          } catch (err) {
+            console.warn(`[religar] "${p.name}" falhou:`, err);
+          }
+        }
+        if (ok === pendentes.length) {
+          toast(`${ok} PDF(s) restaurado(s).`);
+        } else {
+          // Arquivo movido, renomeado ou permissao negada: sobra o seletor.
+          toast("Não deu para restaurar tudo. Selecione os arquivos.");
+          await oferecerSelecaoManual(pendentes.filter((p) => !openPdfs.has(p.id)));
+        }
+      },
+    });
+    return;
+  }
+
+  await oferecerSelecaoManual(pendentes);
+}
+
+// Sem cracha (outro computador, outro navegador, arquivo trocado): o usuario
+// aponta os arquivos e o casamento e feito pelo nome.
+function oferecerSelecaoManual(pendentes) {
+  if (!pendentes.length) return Promise.resolve();
+  const nomes = pendentes.map((p) => p.name).join(", ");
+  mostrarBarraReligacao({
+    texto: `Este projeto usa ${pendentes.length} PDF(s): ${nomes}.`,
+    rotulo: "Selecionar arquivos",
+    acao: async () => {
+      const arquivos = await escolherArquivos();
+      if (!arquivos.length) return;
+
+      const porNome = new Map();
+      for (const f of arquivos) porNome.set(f.name, f);
+
+      let ok = 0;
+      for (const p of pendentes) {
+        const f = porNome.get(p.name);
+        if (!f) continue;
+        try {
+          if (await restaurarPdf(p, f)) ok++;
+        } catch (err) {
+          console.error(`[religar] "${p.name}" falhou:`, err);
+        }
+      }
+
+      const faltando = pendentes.filter((p) => !openPdfs.has(p.id));
+      if (faltando.length) {
+        toast(`Faltou: ${faltando.map((p) => p.name).join(", ")}.`);
+        oferecerSelecaoManual(faltando);
+      } else {
+        toast(`${ok} PDF(s) restaurado(s).`);
+      }
+    },
+  });
+  return Promise.resolve();
+}
+
+// Escolhe arquivos e, quando da, ja guarda o cracha para a proxima vez.
+async function escolherArquivos() {
+  if (TEM_FS_API) {
+    try {
+      const handles = await window.showOpenFilePicker({
+        multiple: true,
+        types: [{ description: "PDF", accept: { "application/pdf": [".pdf"] } }],
+      });
+      const arquivos = [];
+      for (const h of handles) {
+        const f = await h.getFile();
+        await idbSet(fileKeyOf(f), h);
+        arquivos.push(f);
+      }
+      return arquivos;
+    } catch (err) {
+      if (err && err.name === "AbortError") return [];
+      console.warn("[religar] picker indisponível, usando o input:", err);
+    }
+  }
+
+  // Fallback: um <input type=file> descartavel, resolvido pelo evento.
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/pdf,.pdf";
+    input.multiple = true;
+    input.addEventListener("change", () => resolve(Array.from(input.files)));
+    input.addEventListener("cancel", () => resolve([]));
+    input.click();
+  });
+}
+
+function mostrarBarraReligacao({ texto, rotulo, acao }) {
+  const bar = $("#relink-bar");
+  const btn = $("#relink-action");
+  $("#relink-text").textContent = texto;
+  btn.textContent = rotulo;
+
+  // O listener e trocado a cada oferta; clonar o botao descarta o anterior sem
+  // precisar guardar referencia para removeEventListener.
+  const novo = btn.cloneNode(true);
+  // A oferta seguinte e montada de dentro do handler da anterior, com o botao
+  // ainda desabilitado; sem isto o clone nascia travado e a barra virava
+  // enfeite na segunda rodada.
+  novo.disabled = false;
+  btn.replaceWith(novo);
+  novo.addEventListener("click", async () => {
+    novo.disabled = true;
+    // A barra sai de cena antes da ação; se ainda faltar algum PDF, a própria
+    // ação a reexibe com a lista reduzida.
+    esconderBarraReligacao();
+    try {
+      await acao();
+    } catch (err) {
+      console.error("[religar] ação falhou:", err);
+      toast("Não foi possível restaurar os PDFs.");
+    } finally {
+      novo.disabled = false;
+    }
+  });
+
+  bar.hidden = false;
+}
+
+function esconderBarraReligacao() {
+  $("#relink-bar").hidden = true;
+}
+
+// ---------------------------------------------------------------
+// Splitter (redimensionar painéis)
+// ---------------------------------------------------------------
+function initSplitter() {
+  const splitter = $("#splitter");
+  const main = $("#main");
+  let dragging = false;
+
+  splitter.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    splitter.classList.add("dragging");
+    document.body.style.userSelect = "none";
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const rect = main.getBoundingClientRect();
+    let pct = ((e.clientX - rect.left) / rect.width) * 100;
+    pct = Math.min(80, Math.max(20, pct));
+    pdfPanel.style.flexBasis = pct + "%";
+    if (workspace) Blockly.svgResize(workspace);
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove("dragging");
+    document.body.style.userSelect = "";
+    if (workspace) Blockly.svgResize(workspace);
+  });
+}
+
+// ---------------------------------------------------------------
+// Toolbar
+// ---------------------------------------------------------------
+function initToolbar() {
+  const pdfFileInput = $("#pdfFileInput");
+  const projectFileInput = $("#projectFileInput");
+
+  $("#btnOpenPdf").addEventListener("click", abrirPdfs);
+  pdfFileInput.addEventListener("change", () => {
+    Array.from(pdfFileInput.files).forEach((f) => handlePdfFile(f));
+    pdfFileInput.value = "";
+  });
+
+  btnSelectMode.addEventListener("click", () =>
+    setSelectionMode(!selectionMode)
+  );
+
+  $("#btnExport").addEventListener("click", exportText);
+  $("#relink-skip").addEventListener("click", esconderBarraReligacao);
+
+  $("#btnSave").addEventListener("click", saveProject);
+  $("#btnSaveFull").addEventListener("click", saveProjectWithPdfs);
+
+  $("#btnLoad").addEventListener("click", () => projectFileInput.click());
+  projectFileInput.addEventListener("change", () => {
+    loadProject(projectFileInput.files[0]);
+    projectFileInput.value = "";
+  });
+}
+
+// ---------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------
+// Faixa fixa no topo para falhas que o usuário precisa ver: um toast some em
+// 2,4 s e não serve para "a aplicação subiu quebrada".
+function showBootError(msg) {
+  let bar = document.querySelector("#boot-error");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "boot-error";
+    document.body.appendChild(bar);
+  }
+  bar.textContent = msg;
+}
+
+// Cada passo é isolado: antes bastava um deles lançar (tipicamente o Blockly,
+// quando o CDN não respondia) para os passos seguintes nunca rodarem. Como o
+// `initToolbar` era o penúltimo, o botão "Abrir PDF" ficava sem listener e o
+// clique não fazia absolutamente nada. A toolbar agora vem primeiro e nenhuma
+// falha derruba o resto.
+function bootStep(nome, fn) {
+  try {
+    fn();
+    return true;
+  } catch (err) {
+    console.error(`[boot] falha em ${nome}:`, err);
+    return false;
+  }
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  const faltando = [];
+  if (!LIB_PDFJS) faltando.push("PDF.js");
+  if (!LIB_BLOCKLY) faltando.push("Blockly");
+  if (faltando.length) {
+    showBootError(
+      `Não foi possível carregar ${faltando.join(" e ")} (CDN). ` +
+        "Verifique a conexão com a internet e recarregue a página."
+    );
+  }
+
+  const falhas = [];
+  const passo = (nome, fn) => {
+    if (!bootStep(nome, fn)) falhas.push(nome);
+  };
+
+  // Toolbar primeiro: é o mínimo que precisa funcionar sempre.
+  passo("toolbar", initToolbar);
+  passo("splitter", initSplitter);
+  passo("guarda de arquivos", initGlobalFileGuard);
+  passo("drop de PDF", initPdfDrop);
+  passo("arraste de texto", initPdfTextDrag);
+  passo("pan do canvas", initPdfCanvasPan);
+  passo("zoom do canvas", initPdfCanvasWheel);
+  passo("canvas", applyCanvasTransform);
+  if (LIB_BLOCKLY) {
+    passo("Blockly", initBlockly);
+    passo("drop no Blockly", initBlocklyDrop);
+  }
+
+  if (falhas.length && !faltando.length) {
+    showBootError(`Falha ao iniciar: ${falhas.join(", ")}. Veja o console (F12).`);
+  }
+});

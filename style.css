@@ -1,0 +1,404 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #1e293b;
+}
+
+/* ---------- Toolbar ---------- */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #0f172a;
+  color: #fff;
+  flex: 0 0 auto;
+  border-bottom: 1px solid #334155;
+}
+
+.app-title {
+  font-weight: 700;
+  font-size: 15px;
+  margin-right: 16px;
+  color: #38bdf8;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.btn {
+  padding: 6px 14px;
+  border: 1px solid #475569;
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn:hover {
+  background: #334155;
+}
+
+.btn.toggle.active {
+  background: #16a34a;
+  border-color: #16a34a;
+  color: #fff;
+  font-weight: 600;
+}
+
+/* ---------- Layout principal ---------- */
+#main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+#pdf-panel {
+  flex: 0 0 50%;
+  min-width: 220px;
+  overflow: hidden;
+  background: #525659;
+  position: relative;
+  cursor: grab;
+}
+
+#pdf-panel.panning {
+  cursor: grabbing;
+}
+
+#splitter {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: #0f172a;
+  transition: background 0.15s;
+}
+
+#splitter:hover,
+#splitter.dragging {
+  background: #2563eb;
+}
+
+#blockly-panel {
+  flex: 1;
+  min-width: 220px;
+  position: relative;
+  background: #fff;
+}
+
+#blocklyDiv {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+
+/* ---------- Placeholder / drop zone do PDF ---------- */
+#pdf-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60%;
+}
+
+.placeholder-box {
+  border: 3px dashed #94a3b8;
+  border-radius: 14px;
+  padding: 48px 36px;
+  text-align: center;
+  color: #e2e8f0;
+  max-width: 420px;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.placeholder-title {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.placeholder-text {
+  font-size: 14px;
+  line-height: 1.6;
+  color: #cbd5e1;
+}
+
+#pdf-panel.dragover {
+  outline: 4px solid #38bdf8;
+  outline-offset: -4px;
+}
+
+#pdf-panel.dragover .placeholder-box {
+  border-color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+}
+
+/* ---------- Páginas do PDF ---------- */
+.page-number {
+  color: #e2e8f0;
+  font-size: 12px;
+  text-align: center;
+  margin: 4px 0 6px;
+  user-select: none;
+}
+
+.pdf-page {
+  position: relative;
+  margin: 0 auto 20px;
+  background: #fff;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  width: fit-content;
+}
+
+.pdf-page canvas {
+  display: block;
+}
+
+/* A geometria/posicionamento da textLayer vem do pdf_viewer.css oficial do
+   pdf.js (já carregado no <head>) — aqui só as customizações do projeto,
+   para não haver risco de duas folhas divergirem e descolar a seleção
+   do texto visualmente renderizado no canvas. */
+.textLayer > span {
+  cursor: text;
+}
+
+/* ---------- Modo seleção ---------- */
+body.selection-mode .textLayer {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+/* A textLayer é uma cópia do texto posicionada por cima do canvas; suas
+   métricas nunca batem exatamente com o que o PDF desenhou. Pintá-la de
+   preto 35% sobrepunha duas versões do mesmo texto (aspecto borrado/dobrado).
+   Ela fica invisível — o realce de ::selection continua aparecendo. */
+body.selection-mode .textLayer > span {
+  color: transparent !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  pointer-events: auto !important;
+}
+
+/* ---------- Canvas de PDFs (embeds arrastáveis, com pan/zoom) ---------- */
+#pdf-pages {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+
+.pdf-card {
+  position: absolute;
+  width: 420px;
+  border: 1px solid #334155;
+  border-left: 6px solid var(--pdf-color, #64748b);
+  border-radius: 8px;
+  background: #3f4548;
+  padding: 10px 12px 16px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  cursor: default;
+}
+
+.pdf-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #e2e8f0;
+  font-size: 13px;
+  cursor: move;
+}
+
+.pdf-card-pages {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.pdf-color-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--pdf-color, #64748b);
+  flex: 0 0 auto;
+}
+
+.pdf-card-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pdf-card-close {
+  border: none;
+  background: transparent;
+  color: #cbd5e1;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.pdf-card-close:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+/* Cor de seleção e destaque escopados por PDF, via custom property
+   setada inline no .pdf-card — herdada por tudo dentro dele. */
+body.selection-mode .pdf-card .textLayer > span::selection {
+  background: var(--pdf-color-soft, rgba(100, 116, 139, 0.5)) !important;
+  color: transparent !important;
+}
+
+body.selection-mode .pdf-card {
+  box-shadow: inset 0 0 0 3px var(--pdf-color, #64748b);
+}
+
+/* ---------- Marcação da área de onde o texto foi extraído ---------- */
+.extraction-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Trecho já extraído: sublinhado na cor do PDF de origem, para dar de relance
+   o que ainda falta tirar. `--mark-color` e `--mark-tint` são escritos no
+   elemento por markExtraction(); o fallback cinza só aparece se a marca for
+   criada sem cor, e é neutro de propósito -- um fallback colorido faria
+   trechos de PDFs diferentes parecerem do mesmo. */
+.extraction-mark {
+  position: absolute;
+  border-bottom: 2px solid var(--mark-color, #64748b);
+  background: var(--mark-tint, transparent);
+  border-radius: 1px;
+}
+
+/* ---------- Destaque de drop no Blockly ---------- */
+#blockly-panel.drop-highlight::after {
+  content: "Solte para criar o bloco";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  font-weight: 700;
+  color: #2563eb;
+  background: rgba(147, 197, 253, 0.18);
+  border: 4px dashed #2563eb;
+  pointer-events: none;
+  z-index: 100;
+}
+
+/* ---------- Toast ---------- */
+.toast-host {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+.toast {
+  transform: translateY(16px);
+  background: #0f172a;
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  font-size: 14px;
+  opacity: 0;
+  transition: opacity 0.25s, transform 0.25s;
+  max-width: 80vw;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Falha de boot (CDN fora do ar, init quebrado): precisa ficar na tela, ao
+   contrário do toast, que some sozinho. */
+#boot-error {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  padding: 10px 16px;
+  background: #b91c1c;
+  color: #fff;
+  font: 500 13px/1.4 system-ui, sans-serif;
+  text-align: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
+}
+
+/* Bloco vindo de um PDF: o campo de texto deixa de ser branco e assume o mesmo
+   tom do realce da seleção daquele PDF, para que a origem do trecho seja
+   reconhecível de relance. O `--pdf-block-tint` é posto no <g> raiz do bloco
+   por applyPdfTint().
+
+   O !important é necessário: o Blockly injeta em runtime
+   `.geras-renderer.classic-theme .blocklyEditableText > rect { fill:#fff }`,
+   de especificidade (0,3,1). Empatar com ela exigiria repetir renderer e tema
+   no seletor, amarrando este arquivo a escolhas que o Blockly pode mudar. */
+.pdf-tinted .blocklyEditableText > rect,
+.pdf-tinted .blocklyNonEditableText > rect {
+  fill: var(--pdf-block-tint) !important;
+  fill-opacity: 1 !important;
+}
+
+/* ---------- Barra de religação dos PDFs de um projeto leve ---------- */
+#relink-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #1e293b;
+  color: #e2e8f0;
+  font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .3);
+}
+
+#relink-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#relink-bar .btn.ghost {
+  background: transparent;
+  border-color: #475569;
+  color: #94a3b8;
+}
