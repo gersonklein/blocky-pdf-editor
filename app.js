@@ -65,16 +65,48 @@ function rgbaFromHex(hex, alpha) {
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 }
 
+// Cores de revisão: marcam trechos do texto do bloco (Alt+1..4 na edição) e
+// também servem para trocar a cor do bloco inteiro pelo menu de contexto. O
+// projeto guarda o `id`, então mudar um `hex` aqui recolore o que já foi salvo.
+const MARCA_CORES = [
+  { id: "conferido", nome: "Conferido", hex: "#16a34a", tecla: "1" },
+  { id: "duvida", nome: "Dúvida", hex: "#eab308", tecla: "2" },
+  { id: "corrigir", nome: "Corrigir", hex: "#dc2626", tecla: "3" },
+  { id: "nota", nome: "Nota", hex: "#2563eb", tecla: "4" },
+];
+const MARCA_ALPHA = 0.38;
+const COR_BLOCO_PADRAO = 160;
+
+function marcaCor(id) {
+  return MARCA_CORES.find((c) => c.id === id) || null;
+}
+
+// Cor que o bloco mostra: a escolhida pelo usuário vence a do PDF de origem.
+function corEfetiva(block) {
+  const escolhida = block.corBloco && marcaCor(block.corBloco);
+  if (escolhida) return escolhida.hex;
+  return block.pdfMeta && block.pdfMeta.color ? block.pdfMeta.color : null;
+}
+
 // Sobrevive aos re-renders do Blockly (que recriam os filhos do bloco): a
 // custom property fica no <g> raiz, que persiste, e o CSS a le nos descendentes.
 function applyPdfTint(block) {
-  if (!block || !block.pdfMeta || !block.pdfMeta.color) return;
+  if (!block || block.type !== "pdf_text") return;
   const root = block.getSvgRoot();
   if (!root) return;
-  const tint = tintFromHex(block.pdfMeta.color);
-  if (!tint) return;
+  const tint = tintFromHex(corEfetiva(block) || "");
+  if (!tint) {
+    root.style.removeProperty("--pdf-block-tint");
+    root.classList.remove("pdf-tinted");
+    return;
+  }
   root.style.setProperty("--pdf-block-tint", tint);
   root.classList.add("pdf-tinted");
+}
+
+function aplicarCorBloco(block) {
+  block.setColour(corEfetiva(block) || COR_BLOCO_PADRAO);
+  applyPdfTint(block);
 }
 
 let pdfIdSeq = 0;
@@ -229,22 +261,34 @@ function measureText(text, font) {
 
 // Quebra por largura medida (e não por contagem de caracteres) para bater com
 // o critério que o <textarea> do editor usa.
-function wrapToWidth(text, font, maxPx) {
+//
+// Cada linha vem com `start`, sua posição no texto cru: é o que liga as marcas
+// de cor (guardadas em offsets do texto) às linhas desenhadas. A linha é sempre
+// um recorte do texto cru; o único caractere que some é o espaço da quebra.
+function wrapWithOffsets(text, font, maxPx) {
   const out = [];
+  let pos = 0;
   for (const line of text.split("\n")) {
-    let cur = "";
+    let start = pos;
+    let end = pos; // fim (exclusivo) do que já cabe na linha atual
+    let p = pos;
     for (const word of line.split(" ")) {
-      const test = cur ? cur + " " + word : word;
-      if (cur && measureText(test, font) > maxPx) {
-        out.push(cur);
-        cur = word;
-      } else {
-        cur = test;
+      const wordEnd = p + word.length;
+      if (end > start && measureText(text.slice(start, wordEnd), font) > maxPx) {
+        out.push({ text: text.slice(start, end), start });
+        start = p;
       }
+      end = wordEnd;
+      p = wordEnd + 1; // pula o espaço
     }
-    out.push(cur);
+    out.push({ text: text.slice(start, end), start });
+    pos += line.length + 1; // pula o "\n"
   }
   return out;
+}
+
+function wrapToWidth(text, font, maxPx) {
+  return wrapWithOffsets(text, font, maxPx).map((l) => l.text);
 }
 
 // A classe estende `Blockly.FieldMultilineInput`, então não pode ser avaliada
@@ -279,20 +323,152 @@ function ensureBlockTextField() {
       // caixa de edição recebe. Reaplicar a quebra sobre ela faz os dois
       // convergirem para o mesmo ponto de corte.
       let width = BLOCK_TEXT_WIDTH;
-      let lines = wrapToWidth(raw, font, width);
+      let lines = wrapWithOffsets(raw, font, width);
       for (let pass = 0; pass < 2; pass++) {
-        const widest = Math.max(...lines.map((l) => measureText(l, font)));
+        const widest = Math.max(...lines.map((l) => measureText(l.text, font)));
         if (widest >= width - 0.5) break;
         width = widest;
-        lines = wrapToWidth(raw, font, width);
+        lines = wrapWithOffsets(raw, font, width);
       }
+      // render_() chama este m\u00E9todo logo antes de desenhar: as linhas ficam
+      // guardadas para posicionar as marcas sobre elas.
+      this.linhas_ = lines;
 
       let out = lines
-        .map((l) => l.replace(/\s/g, Blockly.Field.NBSP))
+        .map((l) => l.text.replace(/\s/g, Blockly.Field.NBSP))
         .join("\n");
       const block = this.getSourceBlock();
       if (block && block.RTL) out += "\u200F";
       return out;
+    }
+
+    // O Blockly desenha um <text> por linha. As marcas s\u00E3o ret\u00E2ngulos atr\u00E1s
+    // deles, num <g> pr\u00F3prio fora do `textGroup`: o updateSize_ do Blockly soma
+    // a altura de cada filho do `textGroup`, e um filho a mais cresceria o bloco.
+    render_() {
+      this.linhas_ = null;
+      super.render_();
+      this.desenharMarcas_();
+    }
+
+    desenharMarcas_() {
+      const block = this.getSourceBlock();
+      if (!this.fieldGroup_ || !this.textGroup) return;
+      if (!this.grupoMarcas_ || this.grupoMarcas_.parentNode !== this.fieldGroup_) {
+        this.grupoMarcas_ = document.createElementNS(SVG_NS, "g");
+        this.grupoMarcas_.setAttribute("class", "bloco-marcas");
+      }
+      // Sempre logo antes do texto, para ficar por tr\u00E1s dele.
+      this.fieldGroup_.insertBefore(this.grupoMarcas_, this.textGroup);
+      const g = this.grupoMarcas_;
+      while (g.firstChild) g.removeChild(g.firstChild);
+
+      const marcas = (block && block.marcas) || [];
+      if (!marcas.length || !this.linhas_ || !this.getText()) return;
+
+      const textos = this.textGroup.querySelectorAll("text");
+      this.linhas_.forEach((linha, i) => {
+        const el = textos[i];
+        const fim = linha.start + linha.text.length;
+        if (!el || !linha.text.length) return;
+        for (const m of marcas) {
+          const a = Math.max(m.start, linha.start) - linha.start;
+          const b = Math.min(m.end, fim) - linha.start;
+          if (b <= a) continue;
+          const cor = marcaCor(m.cor);
+          if (!cor) continue;
+          try {
+            // Medida pelo pr\u00F3prio <text>: bate com o que est\u00E1 na tela, com a
+            // fonte que o navegador de fato usou.
+            const x0 = el.getStartPositionOfChar(a).x;
+            const x1 = el.getEndPositionOfChar(b - 1).x;
+            const box = el.getBBox();
+            const r = document.createElementNS(SVG_NS, "rect");
+            r.setAttribute("x", String(x0));
+            r.setAttribute("y", String(box.y));
+            r.setAttribute("width", String(Math.max(1, x1 - x0)));
+            r.setAttribute("height", String(box.height));
+            r.setAttribute("rx", "2");
+            r.setAttribute("fill", rgbaFromHex(cor.hex, MARCA_ALPHA));
+            g.appendChild(r);
+          } catch (_) {
+            // Bloco oculto (flyout fechado, colapsado): sem geometria para medir.
+          }
+        }
+      });
+    }
+
+    // Enquanto o usu\u00E1rio digita, as marcas acompanham o texto. S\u00F3 durante a
+    // edi\u00E7\u00E3o: ao carregar um projeto o estado extra chega antes do valor do
+    // campo, e um ajuste aqui destruiria as marcas rec\u00E9m-carregadas.
+    doValueUpdate_(novo) {
+      const antigo = this.value_;
+      const block = this.getSourceBlock();
+      if (
+        this.isBeingEdited_ &&
+        block &&
+        block.marcas &&
+        block.marcas.length &&
+        typeof antigo === "string" &&
+        typeof novo === "string"
+      ) {
+        block.marcas = ajustarMarcasPorEdicao(block.marcas, antigo, novo);
+      }
+      super.doValueUpdate_(novo);
+    }
+
+    widgetCreate_() {
+      const input = super.widgetCreate_();
+      const block = this.getSourceBlock();
+      // Retrato das marcas ao abrir: ao fechar, vira um \u00FAnico evento de
+      // desfazer, no mesmo grupo da edi\u00E7\u00E3o de texto que o Blockly j\u00E1 abre.
+      this.estadoAoAbrir_ = block ? estadoExtraJson(block) : "";
+      input.classList.add("bloco-texto-editor");
+      if (this.fieldGroup_) this.fieldGroup_.classList.add("editando-marcas");
+      mostrarPaletaMarcas(this);
+      return input;
+    }
+
+    widgetDispose_() {
+      const block = this.getSourceBlock();
+      esconderPaletaMarcas();
+      if (this.htmlInput_) this.lastCaret = this.htmlInput_.selectionStart;
+      if (this.fieldGroup_) this.fieldGroup_.classList.remove("editando-marcas");
+      if (block && Blockly.Events.isEnabled()) {
+        const agora = estadoExtraJson(block);
+        if (this.estadoAoAbrir_ != null && agora !== this.estadoAoAbrir_) {
+          Blockly.Events.fire(
+            new Blockly.Events.BlockChange(block, "mutation", null, this.estadoAoAbrir_, agora)
+          );
+        }
+      }
+      this.estadoAoAbrir_ = null;
+      super.widgetDispose_();
+    }
+
+    onHtmlInputKeyDown_(e) {
+      const block = this.getSourceBlock();
+      const input = this.htmlInput_;
+
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        if (block && input) splitTextBlock(block, input.selectionStart, input.value);
+        return;
+      }
+
+      // e.code e n\u00E3o e.key: com Alt, alguns layouts trocam o caractere da tecla.
+      const tecla = /^(?:Digit|Numpad)([0-9])$/.exec(e.code || "");
+      if (tecla && e.altKey && !e.ctrlKey && !e.metaKey && block && input) {
+        const corId =
+          tecla[1] === "0" ? null : (MARCA_CORES.find((c) => c.tecla === tecla[1]) || {}).id;
+        if (corId !== undefined) {
+          e.preventDefault();
+          grifarSelecao(this, corId);
+          return;
+        }
+      }
+
+      super.onHtmlInputKeyDown_(e);
     }
 
     // Durante a edição o Blockly ignora o texto exibido e dimensiona o campo
@@ -333,15 +509,30 @@ function defineBlocks() {
         "Bloco de texto. Arraste para mover, encaixe para ordenar, edite o conteúdo clicando nele."
       );
     },
-    // Persiste a cor/origem do PDF junto ao bloco (setColour em tempo de
-    // execução não é salvo automaticamente pela serialização do Blockly).
+    // Persiste a cor/origem do PDF, as marcas e a cor escolhida junto ao bloco
+    // (setColour em tempo de execução não é salvo pela serialização do Blockly).
+    // Os campos do PDF ficam no nível de cima, como antes, para projetos antigos
+    // continuarem abrindo.
     saveExtraState: function () {
-      return this.pdfMeta ? { ...this.pdfMeta } : null;
+      const state = this.pdfMeta ? { ...this.pdfMeta } : {};
+      if (this.marcas && this.marcas.length) {
+        state.marcas = this.marcas.map((m) => ({ ...m }));
+      }
+      if (this.corBloco) state.corBloco = this.corBloco;
+      return Object.keys(state).length ? state : null;
     },
+    // Também é o caminho do Ctrl+Z (BlockChange "mutation" chama com `{}`),
+    // então precisa zerar o que não vier no estado.
     loadExtraState: function (state) {
-      if (!state) return;
-      this.pdfMeta = state;
-      if (state.color) this.setColour(state.color);
+      const { marcas, corBloco, ...meta } = state || {};
+      this.pdfMeta = meta.color || meta.pdfId ? meta : null;
+      this.marcas = Array.isArray(marcas) ? marcas.map((m) => ({ ...m })) : [];
+      this.corBloco = corBloco || null;
+      aplicarCorBloco(this);
+      if (this.rendered) {
+        const field = this.getField("TEXT");
+        if (field) field.forceRerender();
+      }
     },
   };
 
@@ -703,6 +894,306 @@ function createTextBlockAt(text, clientX, clientY, meta) {
 
   toast("Bloco criado!");
   return block;
+}
+
+// ---------------------------------------------------------------
+// Marcas de revisão, cor do bloco e divisão
+// ---------------------------------------------------------------
+// Mesmo formato que o Blockly usa nos eventos de "mutation" (JSON ou "").
+function estadoExtraJson(block) {
+  const s = block.saveExtraState();
+  return s ? JSON.stringify(s) : "";
+}
+
+// Aplica `fn` no bloco e registra um evento desfazível com o antes/depois.
+function mudarEstadoBloco(block, fn) {
+  const antes = estadoExtraJson(block);
+  fn();
+  const depois = estadoExtraJson(block);
+  if (antes !== depois && Blockly.Events.isEnabled()) {
+    Blockly.Events.fire(
+      new Blockly.Events.BlockChange(block, "mutation", null, antes, depois)
+    );
+  }
+}
+
+// Ordena, descarta vazias e funde vizinhas da mesma cor.
+function normalizarMarcas(marcas, len) {
+  const out = [];
+  const ordenadas = marcas
+    .map((m) => ({ start: Math.max(0, m.start), end: Math.min(len, m.end), cor: m.cor }))
+    .filter((m) => m.end > m.start)
+    .sort((a, b) => a.start - b.start);
+  for (const m of ordenadas) {
+    const ult = out[out.length - 1];
+    if (ult && ult.cor === m.cor && m.start <= ult.end) ult.end = Math.max(ult.end, m.end);
+    else out.push(m);
+  }
+  return out;
+}
+
+// Tira o intervalo [ini, fim) das marcas, partindo as que o atravessam.
+function recortarMarcas(marcas, ini, fim) {
+  const out = [];
+  for (const m of marcas) {
+    if (m.end <= ini || m.start >= fim) {
+      out.push({ ...m });
+      continue;
+    }
+    if (m.start < ini) out.push({ ...m, end: ini });
+    if (m.end > fim) out.push({ ...m, start: fim });
+  }
+  return out;
+}
+
+// Só o que está dentro de [ini, fim), deslocado para começar em 0.
+function extrairMarcas(marcas, ini, fim) {
+  return marcas
+    .map((m) => ({
+      start: Math.max(m.start, ini) - ini,
+      end: Math.min(m.end, fim) - ini,
+      cor: m.cor,
+    }))
+    .filter((m) => m.end > m.start);
+}
+
+// Acha o trecho trocado (prefixo e sufixo comuns) e desloca as marcas. Texto
+// digitado colado no início de uma marca fica fora dela; no meio, fica dentro.
+function ajustarMarcasPorEdicao(marcas, antigo, novo) {
+  let p = 0;
+  const min = Math.min(antigo.length, novo.length);
+  while (p < min && antigo[p] === novo[p]) p++;
+  let q = 0;
+  while (
+    q < min - p &&
+    antigo[antigo.length - 1 - q] === novo[novo.length - 1 - q]
+  ) {
+    q++;
+  }
+  const fimAntigo = antigo.length - q;
+  const delta = novo.length - antigo.length;
+  const fimNovo = fimAntigo + delta;
+
+  const inicio = (x) => (x < p ? x : x >= fimAntigo ? x + delta : fimNovo);
+  const fim = (x) => (x <= p ? x : x >= fimAntigo ? x + delta : p);
+
+  return normalizarMarcas(
+    marcas.map((m) => ({ start: inicio(m.start), end: fim(m.end), cor: m.cor })),
+    novo.length
+  );
+}
+
+// `corId` null apaga. Sem seleção, vale para o texto inteiro. Chamada durante
+// a edição, não dispara evento: o widgetDispose_ do campo registra a sessão
+// inteira como um passo só de desfazer.
+function aplicarMarca(block, ini, fim, corId, len) {
+  if (ini === fim) {
+    ini = 0;
+    fim = len;
+  }
+  let marcas = recortarMarcas(block.marcas || [], ini, fim);
+  if (corId) marcas.push({ start: ini, end: fim, cor: corId });
+  block.marcas = normalizarMarcas(marcas, len);
+}
+
+// Grifa a seleção do editor aberto (ou o texto todo, sem seleção).
+function grifarSelecao(field, corId) {
+  const block = field.getSourceBlock();
+  const input = field.htmlInput_;
+  if (!block || !input) return;
+  const { selectionStart: s, selectionEnd: f } = input;
+  aplicarMarca(block, s, f, corId, input.value.length);
+  field.forceRerender();
+  // O re-render não recria o <textarea>; a seleção volta para dar para
+  // trocar a cor de novo sem selecionar outra vez.
+  input.focus({ preventScroll: true });
+  input.setSelectionRange(s, f);
+}
+
+function mudarCorBloco(block, corId) {
+  const campo = block.getField("TEXT");
+  // Com o editor aberto, o widgetDispose_ do campo já registra a sessão
+  // inteira como um passo de desfazer.
+  if (campo && campo.isBeingEdited_) {
+    block.corBloco = corId;
+    aplicarCorBloco(block);
+    return;
+  }
+  mudarEstadoBloco(block, () => {
+    block.corBloco = corId;
+    aplicarCorBloco(block);
+  });
+}
+
+// ---------------------------------------------------------------
+// Paleta de grifo: aparece junto do editor de texto do bloco
+// ---------------------------------------------------------------
+let paletaMarcas = null;
+
+function mostrarPaletaMarcas(field) {
+  esconderPaletaMarcas();
+  const block = field.getSourceBlock();
+  if (!block) return;
+
+  const el = document.createElement("div");
+  el.className = "paleta-marcas";
+
+  const linha = (rotulo) => {
+    const l = document.createElement("div");
+    l.className = "paleta-linha";
+    const s = document.createElement("span");
+    s.className = "paleta-rotulo";
+    s.textContent = rotulo;
+    l.appendChild(s);
+    el.appendChild(l);
+    return l;
+  };
+  const botao = (pai, titulo, cor, acao) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "paleta-cor" + (cor ? "" : " paleta-limpar");
+    b.title = titulo;
+    if (cor) b.style.background = cor;
+    else b.textContent = "✕";
+    // mousedown sem default: o <textarea> não perde o foco nem a seleção.
+    b.addEventListener("mousedown", (e) => e.preventDefault());
+    b.addEventListener("click", acao);
+    pai.appendChild(b);
+  };
+
+  const grifo = linha("Grifar");
+  for (const c of MARCA_CORES) {
+    botao(grifo, `${c.nome} (Alt+${c.tecla})`, rgbaFromHex(c.hex, 0.55), () =>
+      grifarSelecao(field, c.id)
+    );
+  }
+  botao(grifo, "Tirar grifo (Alt+0)", null, () => grifarSelecao(field, null));
+
+  const cores = linha("Bloco");
+  for (const c of MARCA_CORES) {
+    botao(cores, `Cor do bloco: ${c.nome}`, c.hex, () => mudarCorBloco(block, c.id));
+  }
+  botao(cores, "Cor original do bloco", null, () => mudarCorBloco(block, null));
+
+  document.body.appendChild(el);
+  paletaMarcas = el;
+  posicionarPaletaMarcas();
+  // O Blockly ainda ajusta o tamanho do editor logo depois de criá-lo.
+  setTimeout(posicionarPaletaMarcas, 0);
+}
+
+function posicionarPaletaMarcas() {
+  if (!paletaMarcas) return;
+  const r = Blockly.WidgetDiv.getDiv().getBoundingClientRect();
+  const h = paletaMarcas.offsetHeight;
+  const acima = r.top - h - 6;
+  paletaMarcas.style.left = Math.max(4, r.left) + "px";
+  paletaMarcas.style.top = (acima >= 50 ? acima : r.bottom + 6) + "px";
+}
+
+function esconderPaletaMarcas() {
+  if (paletaMarcas) paletaMarcas.remove();
+  paletaMarcas = null;
+}
+
+// ---------------------------------------------------------------
+// Dois cliques na borda do bloco: divide entre as linhas
+// ---------------------------------------------------------------
+// Clique no texto abre o editor, então a divisão fica na moldura colorida em
+// volta dele. O corte cai entre as duas linhas mais próximas da altura do clique.
+function initDivisaoPorDuploClique() {
+  blocklyDiv.addEventListener("dblclick", (e) => {
+    const alvo = e.target instanceof Element ? e.target : null;
+    const raiz = alvo && alvo.closest(".blocklyDraggable[data-id]");
+    if (!raiz) return;
+    const block = workspace.getBlockById(raiz.getAttribute("data-id"));
+    if (!block || block.type !== "pdf_text" || block.isInFlyout) return;
+    const campo = block.getField("TEXT");
+    if (!campo || !campo.fieldGroup_) return;
+    if (campo.fieldGroup_.contains(alvo)) return; // clique no texto: é edição
+
+    e.preventDefault();
+    const textos = Array.from(campo.textGroup.querySelectorAll("text"));
+    const linhas = campo.linhas_ || [];
+    if (textos.length < 2 || linhas.length < 2) {
+      toast("Este bloco tem uma linha só: não há onde dividir.");
+      return;
+    }
+
+    let melhor = -1;
+    let dist = Infinity;
+    for (let i = 1; i < textos.length && i < linhas.length; i++) {
+      const y =
+        (textos[i - 1].getBoundingClientRect().bottom + textos[i].getBoundingClientRect().top) / 2;
+      const d = Math.abs(e.clientY - y);
+      if (d < dist) {
+        dist = d;
+        melhor = i;
+      }
+    }
+    if (melhor < 0) return;
+    splitTextBlock(block, linhas[melhor].start, campo.getValue() || "");
+  });
+}
+
+// Corta o bloco em `pos`: ele fica com o que vem antes e um bloco novo, logo
+// abaixo na mesma pilha, fica com o resto. Marcas vão para o lado delas.
+function splitTextBlock(block, pos, value) {
+  const esquerda = value.slice(0, pos);
+  const direita = value.slice(pos);
+  const antes = esquerda.trim();
+  const depois = direita.trim();
+  if (!antes || !depois) {
+    toast("Posicione o cursor no meio do texto para dividir o bloco.");
+    return null;
+  }
+
+  const iniA = esquerda.length - esquerda.trimStart().length;
+  const iniB = pos + (direita.length - direita.trimStart().length);
+  const marcas = block.marcas || [];
+  const marcasA = extrairMarcas(marcas, iniA, iniA + antes.length);
+  const marcasB = extrairMarcas(marcas, iniB, iniB + depois.length);
+
+  // Fecha o editor antes: é ele que registra a edição em curso como um passo
+  // de desfazer separado deste.
+  Blockly.WidgetDiv.hide();
+
+  Blockly.Events.setGroup(true);
+  let novo;
+  try {
+    block.setFieldValue(antes, "TEXT");
+    mudarEstadoBloco(block, () => {
+      block.marcas = marcasA;
+    });
+
+    novo = workspace.newBlock("pdf_text");
+    novo.setFieldValue(depois, "TEXT");
+    novo.initSvg();
+    novo.render();
+    // Com evento: o Ctrl+Y recria o bloco a partir do evento de criação, que
+    // só conhece o estado inicial.
+    mudarEstadoBloco(novo, () => {
+      novo.loadExtraState({
+        ...(block.pdfMeta || {}),
+        marcas: marcasB,
+        corBloco: block.corBloco,
+      });
+    });
+
+    const seguinte = block.getNextBlock();
+    if (seguinte) seguinte.previousConnection.disconnect();
+    block.nextConnection.connect(novo.previousConnection);
+    if (seguinte) novo.nextConnection.connect(seguinte.previousConnection);
+
+    const campo = block.getField("TEXT");
+    if (campo) campo.forceRerender();
+    novo.select();
+  } finally {
+    Blockly.Events.setGroup(false);
+  }
+
+  toast("Bloco dividido.");
+  return novo;
 }
 
 // ---------------------------------------------------------------
@@ -2065,6 +2556,7 @@ window.addEventListener("DOMContentLoaded", () => {
   if (LIB_BLOCKLY) {
     passo("Blockly", initBlockly);
     passo("drop no Blockly", initBlocklyDrop);
+    passo("divisão por duplo clique", initDivisaoPorDuploClique);
   }
 
   if (falhas.length && !faltando.length) {

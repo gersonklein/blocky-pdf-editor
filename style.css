@@ -372,6 +372,64 @@ body.selection-mode .pdf-card {
   fill-opacity: 1 !important;
 }
 
+/* ---------- Marcas de revisão no texto do bloco ---------- */
+/* Os retângulos ficam num <g> próprio atrás do texto (ver desenharMarcas_). */
+.bloco-marcas {
+  pointer-events: none;
+}
+
+/* Com o editor aberto, o <textarea> fica transparente e o texto SVG por baixo
+   some: assim as marcas aparecem atrás do que está sendo digitado, sem texto
+   duplicado. */
+.blocklyHtmlInput.bloco-texto-editor {
+  background: transparent !important;
+}
+.editando-marcas text.blocklyMultilineText {
+  fill: transparent !important;
+}
+
+/* Paleta que acompanha o editor: grifo do trecho e cor do bloco. Acima do
+   WidgetDiv do Blockly (z-index 99999). */
+.paleta-marcas {
+  position: fixed;
+  z-index: 100000;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: #0f172a;
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+  font: 500 12px system-ui, sans-serif;
+  color: #e2e8f0;
+}
+.paleta-linha {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.paleta-rotulo {
+  width: 42px;
+}
+.paleta-cor {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 2px solid rgba(255, 255, 255, .6);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.paleta-cor:hover {
+  border-color: #fff;
+  transform: scale(1.1);
+}
+.paleta-limpar {
+  background: #334155;
+  color: #e2e8f0;
+  font-size: 11px;
+  line-height: 1;
+}
+
 /* ---------- Barra de religação dos PDFs de um projeto leve ---------- */
 /* Mesmo caso do guia: o `display: flex` de autor vence o `[hidden]` da folha
    do navegador, e a barra ficava visível o tempo todo, vazia, mesmo com
