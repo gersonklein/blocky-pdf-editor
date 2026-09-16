@@ -2073,6 +2073,11 @@ function exportText() {
 const PROJECT_FORMAT = "blocky-pdf-editor";
 const PROJECT_VERSION = 3;
 
+// PDFs de um projeto aberto que ainda nao foram religados. Sem guarda-los,
+// salvar antes de religar gravava `pdfs: []` e o projeto perdia a referencia
+// aos arquivos -- a barra "Restaurar PDFs" nunca mais aparecia.
+const pdfsNaoReligados = new Map();
+
 function bytesToBase64(bytes) {
   // Em pedaços: `String.fromCharCode(...bytes)` de uma vez estoura a pilha
   // em PDFs de poucos MB.
@@ -2114,6 +2119,10 @@ function buildProject(embed) {
     };
     if (embed) p.data = bytesToBase64(info.bytes);
     pdfs.push(p);
+  }
+  // Seguem como estavam no projeto original (sem bytes: nao os temos).
+  for (const p of pdfsNaoReligados.values()) {
+    if (!openPdfs.has(p.id)) pdfs.push(p);
   }
 
   return {
@@ -2174,6 +2183,7 @@ async function loadProject(file) {
   const blocos = novo ? projeto.blocks : projeto;
 
   esconderBarraReligacao();
+  pdfsNaoReligados.clear();
   for (const id of Array.from(openPdfs.keys())) closePdf(id, true);
 
   try {
@@ -2233,6 +2243,7 @@ async function loadProject(file) {
   if (falhas) toast(`${falhas} PDF(s) do projeto não puderam ser abertos.`);
 
   if (pendentes.length) {
+    for (const p of pendentes) pdfsNaoReligados.set(p.id, p);
     await oferecerReligacao(pendentes);
   } else if (!falhas) {
     toast(`Projeto carregado: ${lista.length} PDF(s).`);
@@ -2246,7 +2257,9 @@ async function loadProject(file) {
 // Restaura um PDF a partir de um File ja em maos.
 async function restaurarPdf(p, file) {
   const buf = await file.arrayBuffer();
-  return loadPdf(buf, p.name, { restore: p });
+  const info = await loadPdf(buf, p.name, { restore: p });
+  if (info) pdfsNaoReligados.delete(p.id);
+  return info;
 }
 
 // Quais pendentes tem cracha de acesso valido neste navegador. `queryPermission`
