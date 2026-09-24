@@ -1891,16 +1891,149 @@ function refreshPdfResolution() {
   }
 }
 
+// ---------------------------------------------------------------
+// Arquivos .txt: convertidos em PDF no próprio navegador
+// ---------------------------------------------------------------
+// O resto do app (seleção, sublinhados, zoom, "Salvar com PDFs", religação)
+// fala PDF. Em vez de um segundo caminho de exibição, o texto vira um PDF
+// simples (Courier, A4) e segue pelo loadPdf() como qualquer outro.
+const TIPOS_ABERTOS = {
+  "application/pdf": [".pdf"],
+  "text/plain": [".txt"],
+};
+const ACCEPT_ABERTOS = "application/pdf,.pdf,text/plain,.txt";
+
+function isPdfFile(file) {
+  return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+}
+
+function isTxtFile(file) {
+  return file.type === "text/plain" || /\.txt$/i.test(file.name);
+}
+
+// UTF-8 é o padrão hoje, mas .txt salvo no Bloco de Notas antigo costuma vir
+// em Windows-1252 (ou UTF-16, com BOM). Um UTF-8 inválido denuncia o 1252.
+function decodificarTexto(buf) {
+  const b = new Uint8Array(buf);
+  if (b[0] === 0xff && b[1] === 0xfe) return new TextDecoder("utf-16le").decode(b);
+  if (b[0] === 0xfe && b[1] === 0xff) return new TextDecoder("utf-16be").decode(b);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(b);
+  } catch (_) {
+    return new TextDecoder("windows-1252").decode(b);
+  }
+}
+
+// Unicode → byte do WinAnsiEncoding (a codificação da fonte Courier padrão).
+// Latin-1 passa direto; a faixa 0x80–0x9F traz aspas curvas, travessões etc.
+const WIN_ANSI_EXTRA = {
+  "€": 0x80, "‚": 0x82, "ƒ": 0x83, "„": 0x84, "…": 0x85, "†": 0x86,
+  "‡": 0x87, "ˆ": 0x88, "‰": 0x89, "Š": 0x8a, "‹": 0x8b, "Œ": 0x8c,
+  "Ž": 0x8e, "‘": 0x91, "’": 0x92, "“": 0x93, "”": 0x94, "•": 0x95,
+  "–": 0x96, "—": 0x97, "˜": 0x98, "™": 0x99, "š": 0x9a, "›": 0x9b,
+  "œ": 0x9c, "ž": 0x9e, "Ÿ": 0x9f,
+};
+
+function paraWinAnsi(ch) {
+  const c = ch.codePointAt(0);
+  if ((c >= 0x20 && c < 0x7f) || (c >= 0xa0 && c <= 0xff)) return c;
+  return WIN_ANSI_EXTRA[ch] || 0x3f; // "?" para o que a fonte não tem
+}
+
+// Quebra em linhas de no máximo `max` caracteres, preferindo espaços.
+function quebrarLinhas(texto, max) {
+  const out = [];
+  for (const bruta of texto.replace(/\r\n?/g, "\n").split("\n")) {
+    let chars = Array.from(bruta.replace(/\t/g, "    "));
+    while (chars.length > max) {
+      let corte = chars.lastIndexOf(" ", max);
+      if (corte <= 0) corte = max; // palavra maior que a linha: corta seco
+      out.push(chars.slice(0, corte).join(""));
+      chars = chars.slice(chars[corte] === " " ? corte + 1 : corte);
+    }
+    out.push(chars.join(""));
+  }
+  return out;
+}
+
+function textoParaPdf(texto) {
+  const W = 595, H = 842, MARGEM = 56;
+  const FONTE = 10.5, ENTRELINHA = 14;
+  const porLinha = Math.floor((W - 2 * MARGEM) / (FONTE * 0.6)); // Courier: 0,6 em
+  const porPagina = Math.floor((H - 2 * MARGEM) / ENTRELINHA);
+
+  const linhas = quebrarLinhas(texto.normalize("NFC"), porLinha);
+  const paginas = [];
+  for (let i = 0; i < linhas.length; i += porPagina) {
+    paginas.push(linhas.slice(i, i + porPagina));
+  }
+  if (!paginas.length) paginas.push([""]);
+
+  // Tudo é montado como "string binária" (1 caractere = 1 byte), o que deixa
+  // os offsets do xref iguais aos índices da string.
+  const lit = (s) =>
+    "(" +
+    Array.from(s)
+      .map((ch) => {
+        const b = paraWinAnsi(ch);
+        return b === 0x28 || b === 0x29 || b === 0x5c
+          ? "\\" + String.fromCharCode(b)
+          : String.fromCharCode(b);
+      })
+      .join("") +
+    ")";
+
+  const objs = []; // objs[n-1] = corpo do objeto n
+  objs.push("<< /Type /Catalog /Pages 2 0 R >>");
+  objs.push(null); // Pages, preenchido depois de conhecer os filhos
+  objs.push(
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>"
+  );
+  const kids = [];
+  for (const pag of paginas) {
+    const corpo =
+      `BT /F1 ${FONTE} Tf ${ENTRELINHA} TL ${MARGEM} ${H - MARGEM - FONTE} Td\n` +
+      pag.map((l, i) => (i ? "T* " : "") + lit(l) + " Tj").join("\n") +
+      "\nET";
+    objs.push(`<< /Length ${corpo.length} >>\nstream\n${corpo}\nendstream`);
+    const conteudo = objs.length;
+    objs.push(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${W} ${H}] ` +
+        `/Resources << /Font << /F1 3 0 R >> >> /Contents ${conteudo} 0 R >>`
+    );
+    kids.push(`${objs.length} 0 R`);
+  }
+  objs[1] = `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${kids.length} >>`;
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [];
+  objs.forEach((corpo, i) => {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${corpo}\nendobj\n`;
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) pdf += String(off).padStart(10, "0") + " 00000 n \n";
+  pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+
+  const bytes = new Uint8Array(pdf.length);
+  for (let i = 0; i < pdf.length; i++) bytes[i] = pdf.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// Bytes de PDF para o loadPdf(), venha o arquivo como .pdf ou como .txt.
+async function bytesDoArquivo(file) {
+  const buf = await file.arrayBuffer();
+  return isPdfFile(file) ? buf : textoParaPdf(decodificarTexto(buf));
+}
+
 function handlePdfFile(file, dropPos, fileKey) {
   if (!file) return;
-  const isPdf =
-    file.type === "application/pdf" || /\.pdf$/i.test(file.name);
-  if (!isPdf) {
-    toast("Por favor, envie um arquivo PDF.");
+  if (!isPdfFile(file) && !isTxtFile(file)) {
+    toast("Por favor, envie um arquivo PDF ou TXT.");
     return;
   }
-  file
-    .arrayBuffer()
+  bytesDoArquivo(file)
     .then((buf) => loadPdf(buf, file.name, { dropPos, fileKey }))
     .catch((err) => {
       console.error(err);
@@ -1918,7 +2051,7 @@ async function abrirPdfs() {
     try {
       handles = await window.showOpenFilePicker({
         multiple: true,
-        types: [{ description: "PDF", accept: { "application/pdf": [".pdf"] } }],
+        types: [{ description: "PDF ou TXT", accept: TIPOS_ABERTOS }],
       });
     } catch (err) {
       if (err && err.name === "AbortError") return; // usuário fechou o seletor
@@ -2256,7 +2389,7 @@ async function loadProject(file) {
 
 // Restaura um PDF a partir de um File ja em maos.
 async function restaurarPdf(p, file) {
-  const buf = await file.arrayBuffer();
+  const buf = await bytesDoArquivo(file);
   const info = await loadPdf(buf, p.name, { restore: p });
   if (info) pdfsNaoReligados.delete(p.id);
   return info;
@@ -2358,7 +2491,7 @@ async function escolherArquivos() {
     try {
       const handles = await window.showOpenFilePicker({
         multiple: true,
-        types: [{ description: "PDF", accept: { "application/pdf": [".pdf"] } }],
+        types: [{ description: "PDF ou TXT", accept: TIPOS_ABERTOS }],
       });
       const arquivos = [];
       for (const h of handles) {
@@ -2377,7 +2510,7 @@ async function escolherArquivos() {
   return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "application/pdf,.pdf";
+    input.accept = ACCEPT_ABERTOS;
     input.multiple = true;
     input.addEventListener("change", () => resolve(Array.from(input.files)));
     input.addEventListener("cancel", () => resolve([]));

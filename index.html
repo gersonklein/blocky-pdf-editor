@@ -13,7 +13,7 @@
 <body>
   <header id="toolbar">
     <span class="app-title">Blocky PDF Editor</span>
-    <button id="btnOpenPdf" class="btn">Abrir PDF</button>
+    <button id="btnOpenPdf" class="btn">Abrir PDF/TXT</button>
     <button id="btnSelectMode" class="btn toggle" aria-pressed="false">Modo Seleção: OFF</button>
     <span class="spacer"></span>
     <button id="btnExport" class="btn">Exportar Texto</button>
@@ -33,7 +33,7 @@
       <div id="pdf-placeholder">
         <div class="placeholder-box">
           <div class="placeholder-title">Nenhum PDF carregado</div>
-          <div class="placeholder-text">Arraste um arquivo PDF para esta área<br>ou clique em <strong>Abrir PDF</strong></div>
+          <div class="placeholder-text">Arraste um arquivo PDF ou TXT para esta área<br>ou clique em <strong>Abrir PDF/TXT</strong></div>
         </div>
       </div>
       <div id="pdf-pages"></div>
@@ -46,7 +46,7 @@
     </section>
   </main>
 
-  <input type="file" id="pdfFileInput" accept="application/pdf,.pdf" multiple hidden>
+  <input type="file" id="pdfFileInput" accept="application/pdf,.pdf,text/plain,.txt" multiple hidden>
   <input type="file" id="projectFileInput" accept="application/json,.json" hidden>
 
 
