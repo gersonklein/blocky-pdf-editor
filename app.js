@@ -2199,13 +2199,26 @@ function exportText() {
 // ---------------------------------------------------------------
 // Leitura em voz alta (Piper TTS, voz pt_BR do Edresson)
 // ---------------------------------------------------------------
-// A síntese roda no servidor.py (POST /tts → WAV). Aqui só se monta o texto
-// da pilha do bloco selecionado — o mesmo que a exportação escreveria — e se
-// toca pedaço por pedaço: o primeiro áudio começa logo e o próximo já vai
-// sendo sintetizado enquanto o atual toca.
-const TTS_PEDACO = 400; // caracteres por requisição
+// A síntese roda no servidor.py (POST /tts → WAV), ~20x mais rápida que o
+// tempo real. O que faz o clique em "Ouvir" soar na hora:
+//  - o texto vai em pedaços crescentes: o primeiro tem só 3 palavras e fica
+//    pronto em dezenas de ms; os seguintes são gerados enquanto o anterior toca;
+//  - ao selecionar o bloco os primeiros pedaços já são sintetizados e ficam em
+//    cache, então o clique normalmente só dá o play;
+//  - o som sai pelo Web Audio, com os pedaços agendados um colado no outro
+//    (sem o silêncio que o Piper deixa no fim de cada síntese).
+const TTS_PRIMEIRO = 3; // palavras do 1º pedaço
+const TTS_SEGUNDO = 12; // palavras do 2º
+const TTS_PEDACO = 300; // caracteres dos demais, no máximo
+const TTS_PREPARAR = 2; // pedaços sintetizados já na seleção
+const TTS_ADIANTE = 20; // segundos de áudio agendados à frente, no máximo
+const TTS_CACHE = 80; // sínteses guardadas (as mais recentes)
 
-let leitura = null; // { cancelada, tocando, audio, ctrl, parar }
+let leitura = null; // { cancelada, tocando, fontes }
+let audioCtx = null;
+const cacheFala = new Map(); // texto → Promise<{ taxa, amostras }>
+
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Bloco de topo da pilha do bloco selecionado, ou null. getRootBlock() sobe
 // pelos encaixes de cima, então a pilha inteira entra, não só o que está abaixo.
@@ -2218,8 +2231,9 @@ function pilhaSelecionada() {
   return sel.getRootBlock();
 }
 
-// O texto vem do PDF com quebras de linha duras e hifenização no fim da
-// linha: para a voz, cada parágrafo vira uma linha só.
+// Divide o texto em pedaços { texto, pausa }. O texto vem do PDF com quebras
+// de linha duras e hifenização no fim da linha: cada parágrafo vira uma linha
+// só. `pausa` é o silêncio (s) depois do pedaço, conforme onde ele foi cortado.
 function pedacosParaFala(texto) {
   const pedacos = [];
   const paragrafos = texto
@@ -2227,48 +2241,54 @@ function pedacosParaFala(texto) {
     .map((p) =>
       p
         .replace(/-\n(?=\p{Ll})/gu, "")
-        .replace(/\s*\n\s*/g, " ")
+        .replace(/\s+/g, " ")
         .trim()
     )
     .filter(Boolean);
 
   for (const p of paragrafos) {
-    if (p.length <= TTS_PEDACO) {
-      pedacos.push(p);
-      continue;
-    }
-    // Parágrafo longo: junta frases até o limite; frase gigante quebra por palavra.
-    let atual = "";
-    const empurrar = (trecho) => {
-      if (atual && (atual + " " + trecho).length > TTS_PEDACO) {
-        pedacos.push(atual);
-        atual = "";
-      }
-      atual = atual ? atual + " " + trecho : trecho;
+    let atual = [];
+    const fechar = (pausa) => {
+      if (!atual.length) return;
+      pedacos.push({ texto: atual.join(" "), pausa });
+      atual = [];
     };
-    for (const frase of p.split(/(?<=[.!?;:])\s+/)) {
-      if (frase.length <= TTS_PEDACO) empurrar(frase);
-      else frase.split(/\s+/).forEach(empurrar);
+    for (const palavra of p.split(" ")) {
+      atual.push(palavra);
+      const fimFrase = /[.!?;:…]["'”»)\]]*$/.test(palavra);
+      const virgula = /[,—–]["'”»)\]]*$/.test(palavra);
+      const pausa = fimFrase ? 0.3 : virgula ? 0.12 : 0.02;
+      const n = pedacos.length;
+      const tam = atual.join(" ").length;
+      if (n === 0) {
+        if (atual.length >= TTS_PRIMEIRO || fimFrase || virgula) fechar(pausa);
+      } else if (n === 1) {
+        if (atual.length >= TTS_SEGUNDO || fimFrase || (virgula && atual.length >= 4)) {
+          fechar(pausa);
+        }
+      } else if ((fimFrase && tam >= 40) || (virgula && tam >= 200) || tam >= TTS_PEDACO) {
+        fechar(pausa);
+      }
     }
-    if (atual) pedacos.push(atual);
+    fechar(0.45);
+    // Fim de parágrafo pesa mais que qualquer corte interno.
+    pedacos[pedacos.length - 1].pausa = 0.45;
   }
   return pedacos;
 }
 
-async function sintetizarFala(texto, l) {
+async function sintetizarFala(texto) {
   let res;
   try {
     res = await fetch("/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ texto }),
-      signal: l.ctrl.signal,
     });
-  } catch (err) {
-    if (err.name === "AbortError") throw err;
+  } catch (_) {
     throw new Error("Servidor fora do ar. Abra o app pelo iniciar.bat.");
   }
-  if (res.ok) return res.blob();
+  if (res.ok) return res.arrayBuffer();
   // 501 = servidor sem o /tts: um `python -m http.server` puro ou, bem mais
   // comum, a janela do iniciar.bat aberta antes de o servidor.py ganhar a voz.
   if (res.status === 501 || res.status === 405) {
@@ -2285,33 +2305,104 @@ async function sintetizarFala(texto, l) {
   throw new Error(msg);
 }
 
-function tocarFala(blob, l) {
-  const url = URL.createObjectURL(blob);
-  return new Promise((resolve, reject) => {
-    l.parar = resolve;
-    l.audio.onended = resolve;
-    l.audio.onplaying = () => {
-      if (!l.tocando) {
-        l.tocando = true;
-        atualizarBotaoOuvir();
-      }
-    };
-    l.audio.onerror = () => reject(new Error("Não foi possível tocar o áudio."));
-    l.audio.src = url;
-    l.audio.play().catch(reject);
-  }).finally(() => {
-    l.audio.onended = l.audio.onerror = l.audio.onplaying = null;
-    URL.revokeObjectURL(url);
-  });
+// WAV PCM 16 bits (o que o Piper grava) → Float32 mono, já sem o silêncio das
+// pontas. Lido à mão: dispensa decodeAudioData e, com ele, um AudioContext
+// antes do clique (o navegador só libera áudio depois de um gesto).
+function lerWav(buf) {
+  const dv = new DataView(buf);
+  let taxa = 22050;
+  let bits = 16;
+  let canais = 1;
+  let ini = -1;
+  let tam = 0;
+  for (let p = 12; p + 8 <= dv.byteLength; ) {
+    const id = String.fromCharCode(
+      dv.getUint8(p),
+      dv.getUint8(p + 1),
+      dv.getUint8(p + 2),
+      dv.getUint8(p + 3)
+    );
+    const n = dv.getUint32(p + 4, true);
+    if (id === "fmt ") {
+      canais = dv.getUint16(p + 10, true);
+      taxa = dv.getUint32(p + 12, true);
+      bits = dv.getUint16(p + 22, true);
+    } else if (id === "data") {
+      ini = p + 8;
+      tam = Math.min(n, dv.byteLength - ini);
+      break;
+    }
+    p += 8 + n + (n % 2);
+  }
+  if (ini < 0 || bits !== 16) throw new Error("Áudio da voz em formato inesperado.");
+
+  const total = Math.floor(tam / 2 / canais);
+  const amostras = new Float32Array(total);
+  for (let i = 0; i < total; i++) {
+    amostras[i] = dv.getInt16(ini + i * 2 * canais, true) / 32768;
+  }
+
+  const LIMIAR = 0.01;
+  let a = 0;
+  let b = total;
+  while (a < b && Math.abs(amostras[a]) < LIMIAR) a++;
+  while (b > a && Math.abs(amostras[b - 1]) < LIMIAR) b--;
+  a = Math.max(0, a - Math.round(taxa * 0.01));
+  b = Math.min(total, b + Math.round(taxa * 0.03));
+  return { taxa, amostras: amostras.slice(a, b) };
+}
+
+// Mesma frase pedida duas vezes (seleção e depois o clique) sintetiza uma só.
+function sinteseEmCache(texto) {
+  let p = cacheFala.get(texto);
+  if (p) {
+    cacheFala.delete(texto); // reinsere no fim: fica entre as mais recentes
+  } else {
+    p = sintetizarFala(texto).then(lerWav);
+    p.catch(() => {
+      if (cacheFala.get(texto) === p) cacheFala.delete(texto);
+    });
+  }
+  cacheFala.set(texto, p);
+  while (cacheFala.size > TTS_CACHE) cacheFala.delete(cacheFala.keys().next().value);
+  return p;
+}
+
+// Chamado quando a seleção muda: adianta a síntese do começo da pilha.
+let preparoAgendado = null;
+function prepararLeitura() {
+  clearTimeout(preparoAgendado);
+  preparoAgendado = setTimeout(() => {
+    if (leitura) return;
+    const topo = pilhaSelecionada();
+    if (!topo) return;
+    pedacosParaFala(montarPilha(topo))
+      .slice(0, TTS_PREPARAR)
+      .forEach((pd) => sinteseEmCache(pd.texto).catch(() => {}));
+  }, 60);
+}
+
+function contextoAudio() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctx({ latencyHint: "interactive" });
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
 }
 
 function pararLeitura() {
   const l = leitura;
   if (!l) return;
   l.cancelada = true;
-  l.ctrl.abort();
-  l.audio.pause();
-  if (l.parar) l.parar();
+  for (const f of l.fontes) {
+    try {
+      f.stop();
+    } catch (_) {
+      /* já tinha parado */
+    }
+  }
+  l.fontes.clear();
   leitura = null;
   atualizarBotaoOuvir();
 }
@@ -2328,38 +2419,64 @@ async function ouvirPilha() {
     return;
   }
 
-  const l = {
-    cancelada: false,
-    tocando: false,
-    audio: new Audio(),
-    ctrl: new AbortController(),
-    parar: null,
-  };
+  let ctx;
+  try {
+    ctx = contextoAudio(); // dentro do clique: o navegador libera o áudio
+  } catch (_) {
+    toast("Este navegador não tem Web Audio para tocar a voz.", 7000);
+    return;
+  }
+
+  const l = { cancelada: false, tocando: false, fontes: new Set() };
   leitura = l;
   atualizarBotaoOuvir();
 
+  const pendentes = [];
+  const pedir = (i) => {
+    if (i < pedacos.length && !pendentes[i]) {
+      pendentes[i] = sinteseEmCache(pedacos[i].texto);
+      pendentes[i].catch(() => {}); // o erro sobe no await do próprio pedaço
+    }
+  };
+
   try {
-    let proximo = sintetizarFala(pedacos[0], l);
+    pedir(0);
+    pedir(1);
+    let inicio = 0;
     for (let i = 0; i < pedacos.length; i++) {
-      const blob = await proximo;
+      const som = await pendentes[i];
       if (l.cancelada) return;
-      proximo = i + 1 < pedacos.length ? sintetizarFala(pedacos[i + 1], l) : null;
-      // Sem handler, um erro no próximo pedaço vira "unhandled rejection"
-      // antes de chegarmos ao await dele; o erro continua subindo lá.
-      if (proximo) proximo.catch(() => {});
-      await tocarFala(blob, l);
+      pedir(i + 1);
+      pedir(i + 2);
+
+      const buffer = ctx.createBuffer(1, som.amostras.length, som.taxa);
+      buffer.copyToChannel(som.amostras, 0);
+      const fonte = ctx.createBufferSource();
+      fonte.buffer = buffer;
+      fonte.connect(ctx.destination);
+      fonte.onended = () => l.fontes.delete(fonte);
+      // Colado no fim do anterior; se a síntese atrasou, começa já.
+      inicio = Math.max(inicio, ctx.currentTime + 0.02);
+      fonte.start(inicio);
+      l.fontes.add(fonte);
+      inicio += buffer.duration + pedacos[i].pausa;
+
+      if (!l.tocando) {
+        l.tocando = true;
+        atualizarBotaoOuvir();
+      }
+      // Não sintetiza a pilha inteira de uma vez: no máximo ~20 s à frente.
+      while (!l.cancelada && inicio - ctx.currentTime > TTS_ADIANTE) await esperar(250);
       if (l.cancelada) return;
     }
+    while (!l.cancelada && ctx.currentTime < inicio) await esperar(100);
   } catch (err) {
     if (!l.cancelada) {
       console.error("[voz]", err);
       toast(err.message, 7000);
     }
   } finally {
-    if (leitura === l) {
-      leitura = null;
-      atualizarBotaoOuvir();
-    }
+    if (leitura === l) pararLeitura();
   }
 }
 
@@ -2369,8 +2486,6 @@ function atualizarBotaoOuvir() {
   if (leitura) {
     btn.disabled = false;
     btn.classList.add("active");
-    // A primeira síntese leva alguns segundos (o servidor carrega a voz na
-    // primeira vez): sem este estado o clique parecia não ter feito nada.
     btn.innerHTML = leitura.tocando ? "&#9632; Parar" : "&#8987; Gerando voz...";
     btn.title = "Parar a leitura";
     return;
@@ -2429,6 +2544,7 @@ function initLeitura() {
     requestAnimationFrame(() => {
       agendado = false;
       atualizarBotaoOuvir();
+      prepararLeitura();
     });
   });
   atualizarBotaoOuvir();

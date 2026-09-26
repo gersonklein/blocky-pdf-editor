@@ -65,6 +65,14 @@ def carregar_voz():
         return _voz
 
 
+def _precarregar_voz():
+    try:
+        carregar_voz()
+        print(f"Voz {VOZ} pronta.", flush=True)
+    except Exception as err:  # noqa: BLE001 -- so informa; o /tts repete o erro
+        print(f"[AVISO] Leitura em voz alta indisponivel: {err}", flush=True)
+
+
 def sintetizar_wav(texto):
     voz = carregar_voz()
     buf = io.BytesIO()
@@ -132,6 +140,9 @@ def main():
     handler = partial(NoCacheHandler, directory=diretorio)
     with ThreadingHTTPServer(("127.0.0.1", porta), handler) as httpd:
         print(f"Servindo {diretorio} em http://127.0.0.1:{porta}/")
+        # Carregar a voz leva ~2,5 s: feito ja na subida, o primeiro "Ouvir"
+        # nao paga essa espera. Falhar aqui nao impede o resto do app.
+        threading.Thread(target=_precarregar_voz, daemon=True).start()
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
