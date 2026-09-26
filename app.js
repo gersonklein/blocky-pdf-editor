@@ -2199,8 +2199,13 @@ function exportText() {
 // ---------------------------------------------------------------
 // Leitura em voz alta (Piper TTS, voz pt_BR do Edresson)
 // ---------------------------------------------------------------
-// A síntese roda no servidor.py (POST /tts → WAV), ~20x mais rápida que o
-// tempo real. O que faz o clique em "Ouvir" soar na hora:
+// A voz vem de um de dois lugares, decidido uma vez por sessão:
+//  - servidor.py (iniciar.bat): POST /tts → WAV, ~20x mais rápido que o
+//    tempo real;
+//  - o próprio navegador (voz-navegador.js, Piper em WebAssembly), quando não
+//    há servidor — a versão do GitHub Pages. Baixa ~90 MB na primeira vez,
+//    com barra de progresso, e sintetiza ~4x mais rápido que o tempo real.
+// O que faz o clique em "Ouvir" soar na hora:
 //  - o texto vai em pedaços crescentes: o primeiro tem só 3 palavras e fica
 //    pronto em dezenas de ms; os seguintes são gerados enquanto o anterior toca;
 //  - ao selecionar o bloco os primeiros pedaços já são sintetizados e ficam em
@@ -2214,7 +2219,7 @@ const TTS_PREPARAR = 2; // pedaços sintetizados já na seleção
 const TTS_ADIANTE = 20; // segundos de áudio agendados à frente, no máximo
 const TTS_CACHE = 80; // sínteses guardadas (as mais recentes)
 
-let leitura = null; // { cancelada, tocando, fontes }
+let leitura = null; // { cancelada, carregando, tocando, fontes, timerEspera }
 let audioCtx = null;
 const cacheFala = new Map(); // texto → Promise<{ taxa, amostras }>
 
@@ -2342,14 +2347,72 @@ function lerWav(buf) {
     amostras[i] = dv.getInt16(ini + i * 2 * canais, true) / 32768;
   }
 
+  return { taxa, amostras: aparar(amostras, taxa) };
+}
+
+// Tira o silêncio das pontas, deixando 10 ms antes e 30 ms depois: as pausas
+// entre pedaços quem decide é pedacosParaFala().
+function aparar(amostras, taxa) {
   const LIMIAR = 0.01;
+  const total = amostras.length;
   let a = 0;
   let b = total;
   while (a < b && Math.abs(amostras[a]) < LIMIAR) a++;
   while (b > a && Math.abs(amostras[b - 1]) < LIMIAR) b--;
   a = Math.max(0, a - Math.round(taxa * 0.01));
   b = Math.min(total, b + Math.round(taxa * 0.03));
-  return { taxa, amostras: amostras.slice(a, b) };
+  return amostras.slice(a, b);
+}
+
+// De onde vem a voz. O servidor.py responde 400 com JSON {erro} a um texto
+// vazio (sem nem carregar a voz); hospedagem estática dá 404/405/501.
+let origemVoz = null; // Promise<"servidor" | "navegador">
+function detectarOrigemVoz() {
+  if (!origemVoz) {
+    origemVoz = fetch("/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })
+      .then(async (res) => {
+        if (res.status !== 400) return "navegador";
+        try {
+          return (await res.json()).erro ? "servidor" : "navegador";
+        } catch (_) {
+          return "navegador";
+        }
+      })
+      .catch(() => "navegador");
+  }
+  return origemVoz;
+}
+
+let moduloVoz = null;
+function vozNavegador() {
+  if (!moduloVoz) {
+    moduloVoz = import("./voz-navegador.js").catch((err) => {
+      moduloVoz = null;
+      throw new Error("Não foi possível carregar a voz do navegador: " + err.message);
+    });
+  }
+  return moduloVoz;
+}
+
+// Garante a voz pronta antes de tocar. No servidor não há nada a fazer; no
+// navegador pode ser o download de ~90 MB, então a barra mostra o progresso.
+async function garantirVoz(l) {
+  if ((await detectarOrigemVoz()) === "servidor") return;
+  const voz = await vozNavegador();
+  if (voz.pronta()) return;
+  l.carregando = true;
+  atualizarBotaoOuvir();
+  try {
+    await voz.preparar((fracao, rotulo, feito, total) => {
+      if (leitura === l) mostrarProgresso(fracao, rotulo, feito, total);
+    });
+  } finally {
+    l.carregando = false;
+  }
 }
 
 // Mesma frase pedida duas vezes (seleção e depois o clique) sintetiza uma só.
@@ -2358,7 +2421,11 @@ function sinteseEmCache(texto) {
   if (p) {
     cacheFala.delete(texto); // reinsere no fim: fica entre as mais recentes
   } else {
-    p = sintetizarFala(texto).then(lerWav);
+    p = (async () => {
+      if ((await detectarOrigemVoz()) === "servidor") return lerWav(await sintetizarFala(texto));
+      const { taxa, amostras } = await (await vozNavegador()).sintetizar(texto);
+      return { taxa, amostras: aparar(amostras, taxa) };
+    })();
     p.catch(() => {
       if (cacheFala.get(texto) === p) cacheFala.delete(texto);
     });
@@ -2372,10 +2439,24 @@ function sinteseEmCache(texto) {
 let preparoAgendado = null;
 function prepararLeitura() {
   clearTimeout(preparoAgendado);
-  preparoAgendado = setTimeout(() => {
+  preparoAgendado = setTimeout(async () => {
     if (leitura) return;
     const topo = pilhaSelecionada();
     if (!topo) return;
+    try {
+      // Voz do navegador: só adianta se ela já estiver no disco. O download
+      // de ~90 MB espera o primeiro clique em Ouvir, com a barra à vista.
+      if ((await detectarOrigemVoz()) === "navegador") {
+        const voz = await vozNavegador();
+        if (!voz.pronta()) {
+          if (await voz.baixada()) await voz.preparar();
+          else return;
+        }
+      }
+    } catch (_) {
+      return;
+    }
+    if (leitura || pilhaSelecionada() !== topo) return;
     pedacosParaFala(montarPilha(topo))
       .slice(0, TTS_PREPARAR)
       .forEach((pd) => sinteseEmCache(pd.texto).catch(() => {}));
@@ -2403,7 +2484,9 @@ function pararLeitura() {
     }
   }
   l.fontes.clear();
+  clearTimeout(l.timerEspera);
   leitura = null;
+  esconderProgresso();
   atualizarBotaoOuvir();
 }
 
@@ -2427,7 +2510,13 @@ async function ouvirPilha() {
     return;
   }
 
-  const l = { cancelada: false, tocando: false, fontes: new Set() };
+  const l = {
+    cancelada: false,
+    carregando: false,
+    tocando: false,
+    fontes: new Set(),
+    timerEspera: null,
+  };
   leitura = l;
   atualizarBotaoOuvir();
 
@@ -2440,6 +2529,12 @@ async function ouvirPilha() {
   };
 
   try {
+    await garantirVoz(l);
+    if (l.cancelada) return;
+    // Espera curta não pisca a barra; passando de 150 ms, ela aparece.
+    l.timerEspera = setTimeout(() => {
+      if (leitura === l && !l.tocando) mostrarProgresso(null, "Gerando voz...");
+    }, 150);
     pedir(0);
     pedir(1);
     let inicio = 0;
@@ -2463,6 +2558,8 @@ async function ouvirPilha() {
 
       if (!l.tocando) {
         l.tocando = true;
+        clearTimeout(l.timerEspera);
+        esconderProgresso();
         atualizarBotaoOuvir();
       }
       // Não sintetiza a pilha inteira de uma vez: no máximo ~20 s à frente.
@@ -2480,14 +2577,50 @@ async function ouvirPilha() {
   }
 }
 
+// Barra de espera logo abaixo do botão Ouvir. `fracao` null = sem medida
+// (a barra corre de um lado a outro); 0..1 = download/carga da voz.
+function mostrarProgresso(fracao, rotulo, feito, total) {
+  const caixa = $("#voz-progresso");
+  const btn = $("#btnOuvir");
+  if (!caixa || !btn) return;
+  const r = btn.getBoundingClientRect();
+  const largura = 340;
+  caixa.style.left = Math.max(8, Math.min(r.left, window.innerWidth - largura - 8)) + "px";
+  caixa.style.top = r.bottom + 6 + "px";
+  caixa.hidden = false;
+
+  const medido = typeof fracao === "number";
+  caixa.classList.toggle("indeterminado", !medido);
+  $("#voz-progresso-texto").textContent = rotulo || "";
+  const pct = medido ? Math.round(Math.min(1, Math.max(0, fracao)) * 100) : null;
+  $("#voz-progresso-barra").style.width = medido ? pct + "%" : "";
+  const mb = (n) => (n / 1048576).toFixed(0);
+  $("#voz-progresso-num").textContent = !medido
+    ? ""
+    : total && feito < total
+      ? `${mb(feito)} de ${mb(total)} MB · ${pct}%`
+      : `${pct}%`;
+  if (medido) caixa.setAttribute("aria-valuenow", String(pct));
+  else caixa.removeAttribute("aria-valuenow");
+}
+
+function esconderProgresso() {
+  const caixa = $("#voz-progresso");
+  if (caixa) caixa.hidden = true;
+}
+
 function atualizarBotaoOuvir() {
   const btn = $("#btnOuvir");
   if (!btn) return;
   if (leitura) {
     btn.disabled = false;
     btn.classList.add("active");
-    btn.innerHTML = leitura.tocando ? "&#9632; Parar" : "&#8987; Gerando voz...";
-    btn.title = "Parar a leitura";
+    btn.innerHTML = leitura.tocando
+      ? "&#9632; Parar"
+      : leitura.carregando
+        ? "&#8987; Carregando voz..."
+        : "&#8987; Gerando voz...";
+    btn.title = leitura.tocando ? "Parar a leitura" : "Cancelar";
     return;
   }
   const topo = pilhaSelecionada();
@@ -2503,6 +2636,7 @@ function atualizarBotaoOuvir() {
 function initLeitura() {
   const btn = $("#btnOuvir");
   btn.addEventListener("click", ouvirPilha);
+  detectarOrigemVoz(); // já na abertura: o primeiro clique não espera por isso
 
   // O Blockly só desmarca o bloco com clique dentro do próprio workspace:
   // clicando no PDF ou na toolbar, o bloco continuava selecionado por dentro

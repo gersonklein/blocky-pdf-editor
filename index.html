@@ -24,6 +24,14 @@
     <button id="btnGuia" class="btn" title="Como o texto é montado a partir dos blocos">Guia</button>
   </header>
 
+  <div id="voz-progresso" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Carregamento da voz">
+    <div class="voz-progresso-topo">
+      <span id="voz-progresso-texto"></span>
+      <span id="voz-progresso-num"></span>
+    </div>
+    <div class="voz-progresso-trilho"><div id="voz-progresso-barra"></div></div>
+  </div>
+
   <main id="main">
     <section id="pdf-panel">
       <div id="relink-bar" hidden>
@@ -163,6 +171,7 @@ a hipótese inicial.</pre>
             <li><strong>Dividir um bloco:</strong> dê <strong>dois cliques na borda colorida</strong> do bloco, na altura onde quer cortar — o corte cai entre as linhas mais próximas. (Editando, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> corta no cursor.)</li>
             <li><strong>Grifar o que já conferiu:</strong> clique no texto do bloco, selecione um trecho e escolha a cor em <em>Grifar</em> na paleta que aparece em cima (ou <kbd>Alt</kbd>+<kbd>1</kbd>..<kbd>4</kbd>). Sem seleção, grifa o texto todo; &#10005; tira o grifo. O grifo não vai para o .txt.</li>
             <li><strong>Cor do bloco inteiro:</strong> na mesma paleta, linha <em>Bloco</em>; &#10005; volta à cor original.</li>
+            <li><strong>Ouvir:</strong> selecione um bloco e clique em <strong>&#9654; Ouvir</strong> para escutar a pilha dele inteira, na voz do Piper (Edresson, pt-BR). Aberto pelo <code>iniciar.bat</code>, a voz sai do seu computador; online, ela roda no próprio navegador e baixa ~90 MB na primeira vez (a barra mostra o progresso).</li>
             <li>Botão direito no bloco: duplicar, colapsar, desabilitar. Bloco <em>desabilitado</em> continua na tela mas fica fora do .txt — útil para testar uma versão do texto sem apagar nada.</li>
           </ul>
         </section>

@@ -74,6 +74,76 @@ body {
   font-weight: 600;
 }
 
+/* Barra de espera da voz, logo abaixo do botão Ouvir */
+#voz-progresso {
+  position: fixed;
+  z-index: 1000;
+  width: 340px;
+  padding: 10px 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+}
+
+#voz-progresso[hidden] {
+  display: none;
+}
+
+.voz-progresso-topo {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+#voz-progresso-num {
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.voz-progresso-trilho {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  background: #1e293b;
+  border-radius: 3px;
+}
+
+#voz-progresso-barra {
+  height: 100%;
+  width: 0;
+  background: #22c55e;
+  border-radius: 3px;
+  transition: width 0.2s ease-out;
+}
+
+/* Sem medida: um trecho da barra corre de um lado a outro */
+#voz-progresso.indeterminado #voz-progresso-barra {
+  position: absolute;
+  width: 35%;
+  transition: none;
+  animation: voz-correndo 1.1s ease-in-out infinite;
+}
+
+@keyframes voz-correndo {
+  from {
+    left: -35%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #voz-progresso.indeterminado #voz-progresso-barra {
+    animation-duration: 3s;
+  }
+}
+
 /* ---------- Layout principal ---------- */
 #main {
   flex: 1;
