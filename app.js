@@ -150,7 +150,7 @@ const btnSelectMode = $("#btnSelectMode");
 // Toast (feedback rápido)
 // ---------------------------------------------------------------
 let toastHost = null;
-function toast(msg) {
+function toast(msg, ms = 2400) {
   if (!toastHost) {
     toastHost = document.createElement("div");
     toastHost.className = "toast-host";
@@ -164,7 +164,7 @@ function toast(msg) {
   setTimeout(() => {
     t.classList.remove("show");
     setTimeout(() => t.remove(), 300);
-  }, 2400);
+  }, ms);
 }
 
 // ---------------------------------------------------------------
@@ -2205,7 +2205,7 @@ function exportText() {
 // sendo sintetizado enquanto o atual toca.
 const TTS_PEDACO = 400; // caracteres por requisição
 
-let leitura = null; // { cancelada, audio, ctrl, parar }
+let leitura = null; // { cancelada, tocando, audio, ctrl, parar }
 
 // Bloco de topo da pilha do bloco selecionado, ou null. getRootBlock() sobe
 // pelos encaixes de cima, então a pilha inteira entra, não só o que está abaixo.
@@ -2266,12 +2266,15 @@ async function sintetizarFala(texto, l) {
     });
   } catch (err) {
     if (err.name === "AbortError") throw err;
-    throw new Error("Servidor de voz fora do ar. Abra o app pelo iniciar.bat.");
+    throw new Error("Servidor fora do ar. Abra o app pelo iniciar.bat.");
   }
   if (res.ok) return res.blob();
-  // 501 = `python -m http.server` puro, que não conhece o /tts.
+  // 501 = servidor sem o /tts: um `python -m http.server` puro ou, bem mais
+  // comum, a janela do iniciar.bat aberta antes de o servidor.py ganhar a voz.
   if (res.status === 501 || res.status === 405) {
-    throw new Error("A leitura em voz alta precisa do servidor do iniciar.bat.");
+    throw new Error(
+      "O servidor em execução não tem a voz. Feche a janela do iniciar.bat e abra de novo."
+    );
   }
   let msg = `Falha na voz (HTTP ${res.status}).`;
   try {
@@ -2287,11 +2290,17 @@ function tocarFala(blob, l) {
   return new Promise((resolve, reject) => {
     l.parar = resolve;
     l.audio.onended = resolve;
+    l.audio.onplaying = () => {
+      if (!l.tocando) {
+        l.tocando = true;
+        atualizarBotaoOuvir();
+      }
+    };
     l.audio.onerror = () => reject(new Error("Não foi possível tocar o áudio."));
     l.audio.src = url;
     l.audio.play().catch(reject);
   }).finally(() => {
-    l.audio.onended = l.audio.onerror = null;
+    l.audio.onended = l.audio.onerror = l.audio.onplaying = null;
     URL.revokeObjectURL(url);
   });
 }
@@ -2319,10 +2328,15 @@ async function ouvirPilha() {
     return;
   }
 
-  const l = { cancelada: false, audio: new Audio(), ctrl: new AbortController(), parar: null };
+  const l = {
+    cancelada: false,
+    tocando: false,
+    audio: new Audio(),
+    ctrl: new AbortController(),
+    parar: null,
+  };
   leitura = l;
   atualizarBotaoOuvir();
-  if (pedacos.length > 1) toast("Preparando a voz...");
 
   try {
     let proximo = sintetizarFala(pedacos[0], l);
@@ -2339,7 +2353,7 @@ async function ouvirPilha() {
   } catch (err) {
     if (!l.cancelada) {
       console.error("[voz]", err);
-      toast(err.message);
+      toast(err.message, 7000);
     }
   } finally {
     if (leitura === l) {
@@ -2355,7 +2369,9 @@ function atualizarBotaoOuvir() {
   if (leitura) {
     btn.disabled = false;
     btn.classList.add("active");
-    btn.innerHTML = "&#9632; Parar";
+    // A primeira síntese leva alguns segundos (o servidor carrega a voz na
+    // primeira vez): sem este estado o clique parecia não ter feito nada.
+    btn.innerHTML = leitura.tocando ? "&#9632; Parar" : "&#8987; Gerando voz...";
     btn.title = "Parar a leitura";
     return;
   }
@@ -2370,7 +2386,40 @@ function atualizarBotaoOuvir() {
 }
 
 function initLeitura() {
-  $("#btnOuvir").addEventListener("click", ouvirPilha);
+  const btn = $("#btnOuvir");
+  btn.addEventListener("click", ouvirPilha);
+
+  // O Blockly só desmarca o bloco com clique dentro do próprio workspace:
+  // clicando no PDF ou na toolbar, o bloco continuava selecionado por dentro
+  // (e o botão habilitado) embora o usuário o desse por desmarcado. Clique
+  // fora do painel de blocos desmarca de verdade — exceto no próprio botão e
+  // nos pop-ups que o Blockly e a paleta de grifo põem fora do painel.
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      const alvo = e.target;
+      if (!(alvo instanceof Element)) return;
+      if (
+        alvo.closest(
+          "#blockly-panel, #btnOuvir, .blocklyWidgetDiv, .blocklyDropDownDiv, " +
+            ".blocklyTooltipDiv, .blocklyContextMenu, .paleta-marcas"
+        )
+      ) {
+        return;
+      }
+      const getSel = (Blockly.common && Blockly.common.getSelected) || Blockly.getSelected;
+      const sel = getSel ? getSel() : null;
+      // unselect() dispara o evento SELECTED; setSelected(null) só zeraria a
+      // variável, sem apagar o destaque nem avisar o botão.
+      if (sel && sel.workspace === workspace && typeof sel.unselect === "function") {
+        // Fecha antes o editor de texto (grava a edição): aberto, ele fica por
+        // cima do bloco e engole o clique que tentaria selecioná-lo de novo.
+        workspace.hideChaff();
+        sel.unselect();
+      }
+    },
+    true
+  );
 
   let agendado = false;
   workspace.addChangeListener((e) => {
