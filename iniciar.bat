@@ -22,6 +22,14 @@ if not defined PY (
   exit /b 1
 )
 
+rem --- Piper TTS (leitura em voz alta); sem ele o resto do app funciona -----
+%PY% -c "import piper" >nul 2>&1
+if errorlevel 1 (
+  echo   Instalando Piper TTS para a leitura em voz alta...
+  %PY% -m pip install --quiet piper-tts
+  if errorlevel 1 echo   [AVISO] Nao foi possivel instalar o Piper TTS: o botao Ouvir nao vai funcionar.
+)
+
 rem --- Primeira porta livre a partir de 8777 -------------------------------
 set "PORTA="
 for %%P in (8777 8778 8779 8780 8781) do (

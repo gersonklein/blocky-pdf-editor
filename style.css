@@ -61,6 +61,19 @@ body {
   font-weight: 600;
 }
 
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: #1e293b;
+}
+
+#btnOuvir.active {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+  font-weight: 600;
+}
+
 /* ---------- Layout principal ---------- */
 #main {
   flex: 1;

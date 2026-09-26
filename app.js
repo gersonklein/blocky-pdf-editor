@@ -2197,6 +2197,195 @@ function exportText() {
 }
 
 // ---------------------------------------------------------------
+// Leitura em voz alta (Piper TTS, voz pt_BR do Edresson)
+// ---------------------------------------------------------------
+// A síntese roda no servidor.py (POST /tts → WAV). Aqui só se monta o texto
+// da pilha do bloco selecionado — o mesmo que a exportação escreveria — e se
+// toca pedaço por pedaço: o primeiro áudio começa logo e o próximo já vai
+// sendo sintetizado enquanto o atual toca.
+const TTS_PEDACO = 400; // caracteres por requisição
+
+let leitura = null; // { cancelada, audio, ctrl, parar }
+
+// Bloco de topo da pilha do bloco selecionado, ou null. getRootBlock() sobe
+// pelos encaixes de cima, então a pilha inteira entra, não só o que está abaixo.
+function pilhaSelecionada() {
+  if (!workspace) return null;
+  const getSel = (Blockly.common && Blockly.common.getSelected) || Blockly.getSelected;
+  const sel = getSel ? getSel() : null;
+  if (!sel || typeof sel.getRootBlock !== "function") return null;
+  if (sel.workspace !== workspace || sel.isInFlyout) return null;
+  return sel.getRootBlock();
+}
+
+// O texto vem do PDF com quebras de linha duras e hifenização no fim da
+// linha: para a voz, cada parágrafo vira uma linha só.
+function pedacosParaFala(texto) {
+  const pedacos = [];
+  const paragrafos = texto
+    .split(/\n\s*\n/)
+    .map((p) =>
+      p
+        .replace(/-\n(?=\p{Ll})/gu, "")
+        .replace(/\s*\n\s*/g, " ")
+        .trim()
+    )
+    .filter(Boolean);
+
+  for (const p of paragrafos) {
+    if (p.length <= TTS_PEDACO) {
+      pedacos.push(p);
+      continue;
+    }
+    // Parágrafo longo: junta frases até o limite; frase gigante quebra por palavra.
+    let atual = "";
+    const empurrar = (trecho) => {
+      if (atual && (atual + " " + trecho).length > TTS_PEDACO) {
+        pedacos.push(atual);
+        atual = "";
+      }
+      atual = atual ? atual + " " + trecho : trecho;
+    };
+    for (const frase of p.split(/(?<=[.!?;:])\s+/)) {
+      if (frase.length <= TTS_PEDACO) empurrar(frase);
+      else frase.split(/\s+/).forEach(empurrar);
+    }
+    if (atual) pedacos.push(atual);
+  }
+  return pedacos;
+}
+
+async function sintetizarFala(texto, l) {
+  let res;
+  try {
+    res = await fetch("/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texto }),
+      signal: l.ctrl.signal,
+    });
+  } catch (err) {
+    if (err.name === "AbortError") throw err;
+    throw new Error("Servidor de voz fora do ar. Abra o app pelo iniciar.bat.");
+  }
+  if (res.ok) return res.blob();
+  // 501 = `python -m http.server` puro, que não conhece o /tts.
+  if (res.status === 501 || res.status === 405) {
+    throw new Error("A leitura em voz alta precisa do servidor do iniciar.bat.");
+  }
+  let msg = `Falha na voz (HTTP ${res.status}).`;
+  try {
+    msg = (await res.json()).erro || msg;
+  } catch (_) {
+    /* corpo não era JSON */
+  }
+  throw new Error(msg);
+}
+
+function tocarFala(blob, l) {
+  const url = URL.createObjectURL(blob);
+  return new Promise((resolve, reject) => {
+    l.parar = resolve;
+    l.audio.onended = resolve;
+    l.audio.onerror = () => reject(new Error("Não foi possível tocar o áudio."));
+    l.audio.src = url;
+    l.audio.play().catch(reject);
+  }).finally(() => {
+    l.audio.onended = l.audio.onerror = null;
+    URL.revokeObjectURL(url);
+  });
+}
+
+function pararLeitura() {
+  const l = leitura;
+  if (!l) return;
+  l.cancelada = true;
+  l.ctrl.abort();
+  l.audio.pause();
+  if (l.parar) l.parar();
+  leitura = null;
+  atualizarBotaoOuvir();
+}
+
+async function ouvirPilha() {
+  if (leitura) {
+    pararLeitura();
+    return;
+  }
+  const topo = pilhaSelecionada();
+  const pedacos = pedacosParaFala(topo ? montarPilha(topo) : "");
+  if (!pedacos.length) {
+    toast("Selecione um bloco com texto para ouvir.");
+    return;
+  }
+
+  const l = { cancelada: false, audio: new Audio(), ctrl: new AbortController(), parar: null };
+  leitura = l;
+  atualizarBotaoOuvir();
+  if (pedacos.length > 1) toast("Preparando a voz...");
+
+  try {
+    let proximo = sintetizarFala(pedacos[0], l);
+    for (let i = 0; i < pedacos.length; i++) {
+      const blob = await proximo;
+      if (l.cancelada) return;
+      proximo = i + 1 < pedacos.length ? sintetizarFala(pedacos[i + 1], l) : null;
+      // Sem handler, um erro no próximo pedaço vira "unhandled rejection"
+      // antes de chegarmos ao await dele; o erro continua subindo lá.
+      if (proximo) proximo.catch(() => {});
+      await tocarFala(blob, l);
+      if (l.cancelada) return;
+    }
+  } catch (err) {
+    if (!l.cancelada) {
+      console.error("[voz]", err);
+      toast(err.message);
+    }
+  } finally {
+    if (leitura === l) {
+      leitura = null;
+      atualizarBotaoOuvir();
+    }
+  }
+}
+
+function atualizarBotaoOuvir() {
+  const btn = $("#btnOuvir");
+  if (!btn) return;
+  if (leitura) {
+    btn.disabled = false;
+    btn.classList.add("active");
+    btn.innerHTML = "&#9632; Parar";
+    btn.title = "Parar a leitura";
+    return;
+  }
+  const topo = pilhaSelecionada();
+  const temTexto = !!(topo && montarPilha(topo));
+  btn.disabled = !temTexto;
+  btn.classList.remove("active");
+  btn.innerHTML = "&#9654; Ouvir";
+  btn.title = temTexto
+    ? "Ouvir o texto deste bloco e dos blocos encaixados nele"
+    : "Selecione um bloco com texto para ouvir a pilha dele";
+}
+
+function initLeitura() {
+  $("#btnOuvir").addEventListener("click", ouvirPilha);
+
+  let agendado = false;
+  workspace.addChangeListener((e) => {
+    if (e.isUiEvent && e.type !== Blockly.Events.SELECTED) return;
+    if (agendado) return;
+    agendado = true;
+    requestAnimationFrame(() => {
+      agendado = false;
+      atualizarBotaoOuvir();
+    });
+  });
+  atualizarBotaoOuvir();
+}
+
+// ---------------------------------------------------------------
 // Salvar / carregar projeto
 // ---------------------------------------------------------------
 // Os bytes do PDF vao dentro do proprio .json, em base64. E o que permite
@@ -2703,6 +2892,7 @@ window.addEventListener("DOMContentLoaded", () => {
     passo("Blockly", initBlockly);
     passo("drop no Blockly", initBlocklyDrop);
     passo("divisão por duplo clique", initDivisaoPorDuploClique);
+    passo("leitura em voz alta", initLeitura);
   }
 
   if (falhas.length && !faltando.length) {
